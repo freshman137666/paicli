@@ -1049,12 +1049,12 @@ public class Main {
     private static void printBanner() {
         System.out.println("╔══════════════════════════════════════════════════════════╗");
         System.out.println("║                                                          ║");
-        System.out.println("║   ██████╗  █████╗ ██╗ ██████╗██╗     ██╗                ║");
-        System.out.println("║   ██╔══██╗██╔══██╗██║██╔════╝██║     ██║                ║");
-        System.out.println("║   ██████╔╝███████║██║██║     ██║     ██║                ║");
-        System.out.println("║   ██╔═══╝ ██╔══██║██║██║     ██║     ██║                ║");
-        System.out.println("║   ██║     ██║  ██║██║╚██████╗███████╗██║                ║");
-        System.out.println("║   ╚═╝     ╚═╝  ╚═╝╚═╝ ╚═════╝╚══════╝╚═╝                ║");
+        System.out.println("║   ██╗  ██╗██╗  ██╗ ██████╗██╗     ██╗                  ║");
+        System.out.println("║   ██║  ██║██║  ██║██╔════╝██║     ██║                  ║");
+        System.out.println("║   ███████║███████║██║     ██║     ██║                  ║");
+        System.out.println("║   ██╔══██║██╔══██║██║     ██║     ██║                  ║");
+        System.out.println("║   ██║  ██║██║  ██║╚██████╗███████╗██║                  ║");
+        System.out.println("║   ╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝╚══════╝╚═╝                  ║");
         System.out.println("║                                                          ║");
         System.out.printf("║      MCP-Native Agent CLI %-29s║%n", "v" + VERSION);
         System.out.println("║                                                          ║");

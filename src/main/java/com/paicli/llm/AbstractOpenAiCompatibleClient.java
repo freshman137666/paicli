@@ -76,7 +76,7 @@ public abstract class AbstractOpenAiCompatibleClient implements LlmClient {
                 throw new IOException("API返回空响应体");
             }
 
-            BufferedSource source = responseBodyObj.source();
+            BufferedSource source = responseBodyObj.source();                 
             String role = "assistant";
             StringBuilder content = new StringBuilder();
             StringBuilder reasoning = new StringBuilder();

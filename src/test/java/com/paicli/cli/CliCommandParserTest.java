@@ -24,6 +24,51 @@ class CliCommandParserTest {
     }
 
     @Test
+    void parsesConcreteModelNameAsSwitchModelPayload() {
+        CliCommandParser.ParsedCommand command = CliCommandParser.parse("/model step-custom-model");
+
+        assertEquals(CliCommandParser.CommandType.SWITCH_MODEL, command.type());
+        assertEquals("step-custom-model", command.payload());
+    }
+
+    @Test
+    void resolvesConcreteModelNameToProviderAndModel() {
+        Main.ModelSelection step = Main.resolveModelSelection("step-custom-model");
+        assertEquals("step", step.provider());
+        assertEquals("step-custom-model", step.model());
+        assertEquals(true, step.explicitModel());
+
+        Main.ModelSelection glm = Main.resolveModelSelection("glm-4v-plus");
+        assertEquals("glm", glm.provider());
+        assertEquals("glm-4v-plus", glm.model());
+
+        Main.ModelSelection provider = Main.resolveModelSelection("step");
+        assertEquals("step", provider.provider());
+        assertNull(provider.model());
+        assertEquals(false, provider.explicitModel());
+
+        Main.ModelSelection defaultGlm = Main.resolveModelSelection("glm");
+        assertEquals("glm", defaultGlm.provider());
+        assertEquals("glm-5.1", defaultGlm.model());
+        assertEquals(true, defaultGlm.explicitModel());
+
+        Main.ModelSelection explicitGlm = Main.resolveModelSelection("glm-5.1");
+        assertEquals("glm", explicitGlm.provider());
+        assertEquals("glm-5.1", explicitGlm.model());
+        assertEquals(true, explicitGlm.explicitModel());
+
+        Main.ModelSelection kimi = Main.resolveModelSelection("kimi-k2.6");
+        assertEquals("kimi", kimi.provider());
+        assertEquals("kimi-k2.6", kimi.model());
+        assertEquals(true, kimi.explicitModel());
+
+        Main.ModelSelection moonshot = Main.resolveModelSelection("moonshot");
+        assertEquals("kimi", moonshot.provider());
+        assertNull(moonshot.model());
+        assertEquals(false, moonshot.explicitModel());
+    }
+
+    @Test
     void parsesClearSlashCommand() {
         CliCommandParser.ParsedCommand command = CliCommandParser.parse("/clear");
 
@@ -168,6 +213,16 @@ class CliCommandParserTest {
     }
 
     @Test
+    void parsesSnapshotCommands() {
+        assertEquals(CliCommandParser.CommandType.SNAPSHOT, CliCommandParser.parse("/snapshot").type());
+        assertEquals("list", CliCommandParser.parse("/snapshot").payload());
+        assertEquals(CliCommandParser.CommandType.SNAPSHOT, CliCommandParser.parse("/snapshot status").type());
+        assertEquals("status", CliCommandParser.parse("/snapshot status").payload());
+        assertEquals(CliCommandParser.CommandType.RESTORE_SNAPSHOT, CliCommandParser.parse("/restore 2").type());
+        assertEquals("2", CliCommandParser.parse("/restore 2").payload());
+    }
+
+    @Test
     void parsesMcpCommands() {
         assertEquals(CliCommandParser.CommandType.MCP_LIST, CliCommandParser.parse("/mcp").type());
         assertEquals(CliCommandParser.CommandType.MCP_RESTART, CliCommandParser.parse("/mcp restart filesystem").type());
@@ -182,8 +237,58 @@ class CliCommandParserTest {
     }
 
     @Test
+    void parsesBrowserCommands() {
+        assertEquals(CliCommandParser.CommandType.BROWSER, CliCommandParser.parse("/browser").type());
+        assertEquals("status", CliCommandParser.parse("/browser").payload());
+        assertEquals(CliCommandParser.CommandType.BROWSER, CliCommandParser.parse("/browser status").type());
+        assertEquals("status", CliCommandParser.parse("/browser status").payload());
+        assertEquals("connect", CliCommandParser.parse("/browser connect").payload());
+        assertEquals("connect 9333", CliCommandParser.parse("/browser connect 9333").payload());
+        assertEquals("disconnect", CliCommandParser.parse("/browser disconnect").payload());
+        assertEquals("tabs", CliCommandParser.parse("/browser tabs").payload());
+    }
+
+    @Test
+    void parsesTaskCommands() {
+        assertEquals(CliCommandParser.CommandType.TASK, CliCommandParser.parse("/task").type());
+        assertEquals("list", CliCommandParser.parse("/task").payload());
+        assertEquals("add 重构模块", CliCommandParser.parse("/task add 重构模块").payload());
+        assertEquals("cancel task_123", CliCommandParser.parse("/task cancel task_123").payload());
+        assertEquals("log task_123", CliCommandParser.parse("/task log task_123").payload());
+    }
+
+    @Test
     void parsesCancelCommand() {
         assertEquals(CliCommandParser.CommandType.CANCEL, CliCommandParser.parse("/cancel").type());
         assertEquals(CliCommandParser.CommandType.CANCEL, CliCommandParser.parse("cancel").type());
+    }
+
+    @Test
+    void parsesSkillListCommand() {
+        assertEquals(CliCommandParser.CommandType.SKILL_LIST, CliCommandParser.parse("/skill").type());
+        assertEquals(CliCommandParser.CommandType.SKILL_LIST, CliCommandParser.parse("/skill list").type());
+    }
+
+    @Test
+    void parsesSkillReloadCommand() {
+        assertEquals(CliCommandParser.CommandType.SKILL_RELOAD, CliCommandParser.parse("/skill reload").type());
+    }
+
+    @Test
+    void parsesSkillShowCommand() {
+        CliCommandParser.ParsedCommand cmd = CliCommandParser.parse("/skill show web-access");
+        assertEquals(CliCommandParser.CommandType.SKILL_SHOW, cmd.type());
+        assertEquals("web-access", cmd.payload());
+    }
+
+    @Test
+    void parsesSkillOnOffCommands() {
+        CliCommandParser.ParsedCommand on = CliCommandParser.parse("/skill on web-access");
+        assertEquals(CliCommandParser.CommandType.SKILL_ON, on.type());
+        assertEquals("web-access", on.payload());
+
+        CliCommandParser.ParsedCommand off = CliCommandParser.parse("/skill off verbose-debug");
+        assertEquals(CliCommandParser.CommandType.SKILL_OFF, off.type());
+        assertEquals("verbose-debug", off.payload());
     }
 }

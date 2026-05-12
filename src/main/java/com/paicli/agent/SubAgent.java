@@ -2,21 +2,35 @@ package com.paicli.agent;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.paicli.context.TokenUsageFormatter;
 import com.paicli.llm.LlmClient;
+import com.paicli.llm.LlmTraceLogger;
+import com.paicli.lsp.LspDiagnosticReport;
+import com.paicli.memory.ConversationHistoryCompactor;
+import com.paicli.context.ContextProfile;
+import com.paicli.prompt.PromptAssembler;
+import com.paicli.prompt.PromptContext;
+import com.paicli.prompt.PromptMode;
+import com.paicli.skill.SkillContextBuffer;
+import com.paicli.skill.SkillIndexFormatter;
+import com.paicli.skill.SkillRegistry;
 import com.paicli.tool.ToolRegistry;
 import com.paicli.tool.ToolRegistry.ToolExecutionResult;
 import com.paicli.tool.ToolRegistry.ToolInvocation;
 import com.paicli.util.AnsiStyle;
 import com.paicli.util.TerminalMarkdownRenderer;
+import com.paicli.image.ImageReferenceParser;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.io.PrintStream;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Supplier;
 
 /**
  * 子代理 - 可配置角色的轻量 Agent
@@ -33,93 +47,11 @@ public class SubAgent {
     private final LlmClient llmClient;
     private final ToolRegistry toolRegistry;
     private final List<LlmClient.Message> conversationHistory;
-
-    // 各角色的系统提示词
-    private static final String PLANNER_PROMPT = """
-            你是一个任务规划专家。你的职责是分析用户的需求，将其拆解为清晰的执行步骤。
-
-            请按以下 JSON 格式输出执行计划：
-            {
-                "summary": "任务摘要",
-                "steps": [
-                    {
-                        "id": "step_1",
-                        "description": "步骤描述，要具体明确",
-                        "type": "FILE_READ | FILE_WRITE | COMMAND | ANALYSIS | VERIFICATION",
-                        "dependencies": []
-                    }
-                ]
-            }
-
-            规则：
-            1. 每个步骤必须有唯一的 id（如 step_1, step_2）
-            2. dependencies 列出依赖的步骤 id
-            3. 步骤描述要具体，让执行者能直接理解要做什么
-            4. 简单任务可以只拆成 1-3 步
-            5. 复杂任务拆成 5-10 步
-            6. 不要为了凑步数引入无关操作
-            7. 如果多个步骤可以独立完成，不要给它们添加依赖；保持 dependencies 为空，让编排器能并行分配给多个 Worker。
-               例如同时读取 pom.xml、README.md、ROADMAP.md 时，应拆成 3 个无依赖 FILE_READ 步骤。
-            8. 只有后一步确实需要前一步结果时，才写 dependencies。
-
-            只输出 JSON，不要有其他内容。
-            请用中文回复。
-            """;
-
-    private static final String WORKER_PROMPT = """
-            你是一个任务执行专家。你的职责是根据给定的任务步骤，调用工具完成具体操作。
-
-            可用工具：
-            1. read_file - 读取文件内容，参数：{"path": "文件路径"}
-            2. write_file - 写入文件内容，参数：{"path": "文件路径", "content": "内容"}
-            3. list_dir - 列出目录内容，参数：{"path": "目录路径"}
-            4. execute_command - 执行命令，参数：{"command": "命令"}
-            5. create_project - 创建项目，参数：{"name": "名称", "type": "java|python|node"}
-            6. search_code - 语义检索代码库，参数：{"query": "自然语言描述", "top_k": 5}
-            7. web_search - 搜索互联网获取实时信息，参数：{"query": "搜索关键词", "top_k": 5}
-            8. web_fetch - 抓取已知 URL 并返回正文 Markdown，参数：{"url": "https://...", "max_chars": 8000}
-            9. mcp__{server}__{tool} - MCP server 动态提供的外部工具，具体参数以工具 schema 为准
-
-            如果任务涉及理解代码库，请优先使用 search_code 工具。
-            如果任务涉及实时性或互联网信息（如"框架最新版本"、"官方文档说明"），先用 web_search 找入口，
-            拿到 URL 后用 web_fetch 取全文。已经有 URL 时直接 web_fetch，不要再 web_search。
-            web_fetch 拿到空正文（SPA / 防爬墙）时，告知用户这是已知边界，不要反复重试。
-            对于当前项目内的文件，请优先使用 read_file 或 list_dir，不要用 execute_command 扫描 /、~ 或整个文件系统。
-            execute_command 只适合在当前项目目录执行短时命令。
-            安全策略硬规则（HITL 之外的兜底，无法绕过）：read_file / write_file / list_dir / create_project 必须在项目根之内；write_file 单文件 5MB 上限；
-            execute_command 禁止 sudo / rm -rf 全盘 / mkfs / dd of=/dev / fork bomb / curl|sh / find / / chmod 777 / / shutdown。
-            被策略拒绝的工具调用（"🛡️ 策略拒绝" 开头）不要原样重试，改用项目内相对路径或更安全的命令。
-            MCP 工具来自外部 server，默认会触发 HITL 审批与审计；除非任务确实需要该 server 能力，否则优先使用内置工具。
-            同一轮返回多个工具调用时，系统会并行执行这些工具；如果工具之间有依赖关系，请分多轮调用。
-            如果需要同时检查多个已知且互不依赖的文件或目录（例如同时读取 pom.xml、README.md、ROADMAP.md，
-            或同时列出 src/main/java、src/test/java、src/main/resources），请在同一轮返回多个 read_file/list_dir 工具调用。
-            如果是 ANALYSIS 或 VERIFICATION 类型任务，请直接输出分析结果。
-
-            请用中文回复。
-            """;
-
-    private static final String REVIEWER_PROMPT = """
-            你是一个质量检查专家。你的职责是检查执行结果是否正确、完整和高质量。
-
-            检查要点：
-            1. 任务是否按要求完成
-            2. 结果是否正确，有无明显错误
-            3. 是否遗漏了重要步骤或细节
-            4. 输出格式是否规范
-
-            请以 JSON 格式输出检查结果：
-            {
-                "approved": true 或 false,
-                "summary": "检查摘要",
-                "issues": ["问题1", "问题2"],
-                "suggestions": ["建议1", "建议2"]
-            }
-
-            如果 approved 为 true，issues 为空即可。
-            如果 approved 为 false，请详细说明问题并给出改进建议。
-            只输出 JSON，不要有其他内容。
-            请用中文回复。
-            """;
+    private Supplier<String> externalContextSupplier = () -> "";
+    private SkillRegistry skillRegistry;
+    private SkillContextBuffer skillContextBuffer;
+    private final ConversationHistoryCompactor historyCompactor;
+    private final PromptAssembler promptAssembler = PromptAssembler.createDefault();
 
     public SubAgent(String name, AgentRole role, LlmClient llmClient, ToolRegistry toolRegistry) {
         this.name = name;
@@ -127,18 +59,92 @@ public class SubAgent {
         this.llmClient = llmClient;
         this.toolRegistry = toolRegistry;
         this.conversationHistory = new ArrayList<>();
+        this.historyCompactor = new ConversationHistoryCompactor(llmClient);
         this.conversationHistory.add(LlmClient.Message.system(getSystemPrompt()));
+    }
+
+    public void setExternalContextSupplier(Supplier<String> externalContextSupplier) {
+        this.externalContextSupplier = externalContextSupplier == null ? () -> "" : externalContextSupplier;
+        refreshSystemPrompt();
+    }
+
+    public void setSkillRegistry(SkillRegistry skillRegistry) {
+        this.skillRegistry = skillRegistry;
+        refreshSystemPrompt();
+    }
+
+    public void setSkillContextBuffer(SkillContextBuffer skillContextBuffer) {
+        this.skillContextBuffer = skillContextBuffer;
     }
 
     /**
      * 根据角色获取系统提示词
      */
     private String getSystemPrompt() {
+        return promptAssembler.assemble(promptMode(), PromptContext.builder()
+                .externalContext(buildExternalContext())
+                .skillIndex(buildSkillIndex())
+                .build());
+    }
+
+    private PromptMode promptMode() {
         return switch (role) {
-            case PLANNER -> PLANNER_PROMPT;
-            case WORKER -> WORKER_PROMPT;
-            case REVIEWER -> REVIEWER_PROMPT;
+            case PLANNER -> PromptMode.TEAM_PLANNER;
+            case WORKER -> PromptMode.TEAM_WORKER;
+            case REVIEWER -> PromptMode.TEAM_REVIEWER;
         };
+    }
+
+    private void maybeCompactHistory(PrintStream out) {
+        if (historyCompactor == null) return;
+        ContextProfile profile = toolRegistry == null ? null : toolRegistry.getContextProfile();
+        if (profile == null) return;
+        try {
+            boolean compacted = historyCompactor.compactIfNeeded(conversationHistory, profile.compressionTriggerTokens());
+            if (compacted && out != null) {
+                out.println("📦 [" + name + "] 上下文接近窗口上限，已把早期对话压缩为摘要后继续。");
+            }
+        } catch (Exception e) {
+            log.warn("[{}] conversationHistory compaction failed", name, e);
+        }
+    }
+
+    private String buildSkillIndex() {
+        if (skillRegistry == null) return "";
+        try {
+            return SkillIndexFormatter.format(skillRegistry.enabledSkills());
+        } catch (Exception e) {
+            log.warn("[{}] failed to build skill index", name, e);
+            return "";
+        }
+    }
+
+    private String prependSkillBodies(String content) {
+        if (skillContextBuffer == null || skillContextBuffer.isEmpty()) {
+            return content;
+        }
+        String drained = skillContextBuffer.drain();
+        if (drained.isEmpty()) return content;
+        return drained + "\n" + content;
+    }
+
+    private void refreshSystemPrompt() {
+        if (!conversationHistory.isEmpty()) {
+            conversationHistory.set(0, LlmClient.Message.system(getSystemPrompt()));
+        }
+    }
+
+    private String buildExternalContext() {
+        if (!toolRegistry.getContextProfile().mcpResourceIndexEnabled()) {
+            return "";
+        }
+        try {
+            String context = externalContextSupplier.get();
+            return context == null ? "" : context.trim();
+        } catch (Exception e) {
+            log.warn("[{}] failed to build external context", name, e);
+            return "";
+        }
     }
 
     /**
@@ -154,22 +160,26 @@ public class SubAgent {
      */
     public AgentMessage execute(AgentMessage task, PrintStream out) {
         log.info("[{}] executing task from {}: type={}", name, task.fromAgent(), task.type());
-        String taskContent = task.content();
+        pruneHistoricalImagePayloads();
+        refreshSystemPrompt();
+        String taskContent = prependSkillBodies(task.content());
 
         // 将任务注入对话
-        conversationHistory.add(LlmClient.Message.user(taskContent));
+        conversationHistory.add(ImageReferenceParser.userMessage(
+                taskContent,
+                Path.of(toolRegistry.getProjectPath())));
 
         SubAgentStreamRenderer streamRenderer = new SubAgentStreamRenderer(name, role, out);
 
         long startNanos = System.nanoTime();
-        AgentBudget budget = AgentBudget.fromSystemProperties();
+        AgentBudget budget = AgentBudget.fromLlmClient(llmClient);
 
         // 与 Agent.java 对称：主退出条件 = LLM 自决，budget 仅在 token / 停滞 / 硬轮数兜底。
         while (true) {
             AgentBudget.ExitReason exitReason = budget.check();
             if (exitReason != AgentBudget.ExitReason.WITHIN_BUDGET) {
                 streamRenderer.finish();
-                out.println(formatTokenStats(budget.totalInputTokens(), budget.totalOutputTokens(), startNanos));
+                out.println(formatTokenStats(budget, startNanos));
                 String description = budget.describeExit(exitReason);
                 log.warn("[{}] run exhausted budget: reason={}, iteration={}, tokens={}/{}",
                         name, exitReason, budget.iteration(),
@@ -179,14 +189,22 @@ public class SubAgent {
 
             budget.beginIteration();
 
+            // 调 LLM 前评估 conversationHistory 是否接近 window 上限；超阈值压缩早期消息为摘要。
+            injectPendingLspDiagnostics(out);
+            maybeCompactHistory(out);
+
             try {
                 LlmClient.ChatResponse response = llmClient.chat(
                         conversationHistory,
                         shouldUseTools() ? toolRegistry.getToolDefinitions() : null,
                         streamRenderer
                 );
+                LlmTraceLogger.logReasoning(log,
+                        "sub-agent name=" + name + " role=" + role + " iteration=" + budget.iteration(),
+                        llmClient,
+                        response.reasoningContent());
 
-                budget.recordTokens(response.inputTokens(), response.outputTokens());
+                budget.recordTokens(response.inputTokens(), response.outputTokens(), response.cachedInputTokens());
 
                 if (response.hasToolCalls()) {
                     budget.recordToolCalls(response.toolCalls());
@@ -205,17 +223,15 @@ public class SubAgent {
                     for (ToolExecutionResult toolResult : toolResults) {
                         conversationHistory.add(LlmClient.Message.tool(toolResult.id(), toolResult.result()));
                     }
+                    appendImageToolMessages(toolResults);
                     continue;
                 }
 
                 // 没有工具调用，返回最终结果
-                conversationHistory.add(LlmClient.Message.assistant(
-                        response.reasoningContent(),
-                        response.content()
-                ));
+                conversationHistory.add(LlmClient.Message.assistant(response.content()));
 
                 streamRenderer.finish();
-                out.println(formatTokenStats(budget.totalInputTokens(), budget.totalOutputTokens(), startNanos));
+                out.println(formatTokenStats(budget, startNanos));
 
                 return AgentMessage.result(name, role, response.content());
 
@@ -266,11 +282,40 @@ public class SubAgent {
         conversationHistory.add(systemMsg);
     }
 
+    private void pruneHistoricalImagePayloads() {
+        int messageCount = 0;
+        int imageCount = 0;
+        for (int i = 0; i < conversationHistory.size(); i++) {
+            LlmClient.Message message = conversationHistory.get(i);
+            int images = message.imagePartCount();
+            if (images <= 0) {
+                continue;
+            }
+            conversationHistory.set(i, message.withoutImageContent());
+            messageCount++;
+            imageCount += images;
+        }
+        if (imageCount > 0) {
+            log.info("[{}] pruned historical image payloads before sub-agent turn: messages={}, images={}",
+                    name, messageCount, imageCount);
+        }
+    }
+
     /**
      * 只有执行者需要工具；规划者和检查者都只输出分析结果。
      */
     private boolean shouldUseTools() {
         return role == AgentRole.WORKER;
+    }
+
+    private void injectPendingLspDiagnostics(PrintStream out) {
+        LspDiagnosticReport report = toolRegistry.flushPendingLspDiagnostics();
+        if (report == null || report.isEmpty()) {
+            return;
+        }
+        conversationHistory.add(LlmClient.Message.user(report.promptText()));
+        out.println(report.displayText());
+        log.info("[{}] injected LSP diagnostics into sub-agent conversation", name);
     }
 
     private List<ToolExecutionResult> executeToolCalls(List<LlmClient.ToolCall> toolCalls) {
@@ -287,6 +332,21 @@ public class SubAgent {
             log.info("[{}] executing {} tool calls in parallel", name, invocations.size());
         }
         return toolRegistry.executeTools(invocations);
+    }
+
+    private void appendImageToolMessages(List<ToolExecutionResult> toolResults) {
+        if (toolResults == null || toolResults.isEmpty()) {
+            return;
+        }
+        for (ToolExecutionResult result : toolResults) {
+            if (!result.hasImageParts()) {
+                continue;
+            }
+            List<LlmClient.ContentPart> parts = new ArrayList<>();
+            parts.add(LlmClient.ContentPart.text("工具 " + result.name() + " 返回了图片内容，请结合上面的工具文本结果分析。"));
+            parts.addAll(result.imageParts());
+            conversationHistory.add(LlmClient.Message.user(parts));
+        }
     }
 
     private static void printToolCalls(PrintStream out, List<LlmClient.ToolCall> toolCalls) {
@@ -317,6 +377,7 @@ public class SubAgent {
             case "search_code" -> "🔍 搜索代码 " + count + " 次";
             case "web_search" -> "🌐 联网搜索 " + count + " 次";
             case "web_fetch" -> "📰 抓取 " + count + " 个网页";
+            case "save_memory" -> "💾 保存长期记忆 " + count + " 条";
             default -> toolName != null && toolName.startsWith("mcp__")
                     ? formatMcpLabel(toolName, count)
                     : "🔧 " + toolName + " × " + count;
@@ -340,6 +401,7 @@ public class SubAgent {
                 case "create_project" -> "name";
                 case "search_code", "web_search" -> "query";
                 case "web_fetch" -> "url";
+                case "save_memory" -> "fact";
                 default -> null;
             };
             if (key == null) {
@@ -355,11 +417,13 @@ public class SubAgent {
         }
     }
 
-    private static String formatTokenStats(int inputTokens, int outputTokens, long startNanos) {
-        double elapsedSeconds = (System.nanoTime() - startNanos) / 1_000_000_000.0;
-        return AnsiStyle.subtle(String.format(
-                "📊 Token: %d 输入 / %d 输出 / %d 合计 | ⏱ %.1fs",
-                inputTokens, outputTokens, inputTokens + outputTokens, elapsedSeconds));
+    private String formatTokenStats(AgentBudget budget, long startNanos) {
+        return TokenUsageFormatter.format(
+                llmClient,
+                budget.totalInputTokens(),
+                budget.totalOutputTokens(),
+                budget.totalCachedInputTokens(),
+                startNanos);
     }
 
     public String getName() {

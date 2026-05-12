@@ -12,11 +12,14 @@ import com.paicli.policy.AuditLog;
 import com.paicli.mcp.transport.McpTransport;
 import com.paicli.mcp.transport.StdioTransport;
 import com.paicli.mcp.transport.StreamableHttpTransport;
+import com.paicli.tool.ToolOutput;
 import com.paicli.tool.ToolRegistry;
 
 import java.io.IOException;
+import java.io.PrintStream;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Comparator;
@@ -27,9 +30,12 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 public class McpServerManager implements AutoCloseable {
+    private static final Duration STARTUP_PROGRESS_INTERVAL = Duration.ofSeconds(5);
+
     private final ToolRegistry toolRegistry;
     private final Path projectDir;
     private final McpConfigLoader configLoader;
@@ -53,6 +59,10 @@ public class McpServerManager implements AutoCloseable {
     }
 
     public void startAll() {
+        startAll(null);
+    }
+
+    public void startAll(PrintStream progressOut) {
         List<McpServer> targets = servers.values().stream()
                 .filter(server -> !server.config().isDisabled())
                 .toList();
@@ -68,14 +78,51 @@ public class McpServerManager implements AutoCloseable {
                     t.setDaemon(true);
                     return t;
                 });
+        Thread progressPrinter = startProgressPrinter(targets, progressOut, STARTUP_PROGRESS_INTERVAL);
         try {
             List<CompletableFuture<Void>> futures = targets.stream()
                     .map(server -> CompletableFuture.runAsync(() -> start(server), executor))
                     .toList();
             CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
         } finally {
+            if (progressPrinter != null) {
+                progressPrinter.interrupt();
+            }
             executor.shutdown();
         }
+    }
+
+    private Thread startProgressPrinter(List<McpServer> targets, PrintStream out, Duration interval) {
+        if (out == null || targets.isEmpty()) {
+            return null;
+        }
+        Map<String, Instant> startedAt = new ConcurrentHashMap<>();
+        targets.forEach(server -> startedAt.put(server.name(), Instant.now()));
+        Thread thread = new Thread(() -> {
+            try {
+                while (!Thread.currentThread().isInterrupted()) {
+                    TimeUnit.MILLISECONDS.sleep(interval.toMillis());
+                    List<McpServer> starting = targets.stream()
+                            .filter(server -> server.status() == McpServerStatus.STARTING)
+                            .sorted(Comparator.comparing(McpServer::name))
+                            .toList();
+                    if (starting.isEmpty()) {
+                        continue;
+                    }
+                    for (McpServer server : starting) {
+                        long waited = Duration.between(startedAt.get(server.name()), Instant.now()).toSeconds();
+                        out.printf("   ⏳ %-16s %-6s 启动中...（已等待 %ds）%n",
+                                server.name(), server.transportName(), waited);
+                    }
+                    out.flush();
+                }
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
+        }, "paicli-mcp-startup-progress");
+        thread.setDaemon(true);
+        thread.start();
+        return thread;
     }
 
     public synchronized String restart(String name) {
@@ -90,6 +137,19 @@ public class McpServerManager implements AutoCloseable {
         return server.status() == McpServerStatus.READY
                 ? "✅ MCP server 已重启: " + name
                 : "❌ MCP server 重启失败: " + name + " - " + server.errorMessage();
+    }
+
+    public synchronized String restartWithArgs(String name, List<String> args) {
+        McpServer server = servers.get(name);
+        if (server == null) {
+            return "未找到 MCP server: " + name;
+        }
+        server.config().setArgs(args);
+        return restart(name);
+    }
+
+    public McpServer server(String name) {
+        return servers.get(name);
     }
 
     public synchronized String disable(String name) {
@@ -187,6 +247,34 @@ public class McpServerManager implements AutoCloseable {
 
     public List<McpResourceDescriptor> resourceCandidates() {
         return resourceCache.all();
+    }
+
+    public String resourceIndexForPrompt() {
+        List<McpResourceDescriptor> resources = resourceCache.all().stream()
+                .sorted(Comparator.comparing(McpResourceDescriptor::serverName)
+                        .thenComparing(McpResourceDescriptor::uri))
+                .limit(200)
+                .toList();
+        if (resources.isEmpty()) {
+            return "";
+        }
+        StringBuilder sb = new StringBuilder("## MCP Resources 索引（仅 URI / 描述，不含正文）\n\n");
+        sb.append("长上下文模式下可参考以下资源索引判断是否需要读取 resource；需要正文时再调用对应 MCP resource 工具或使用用户显式 @-mention。\n\n");
+        for (McpResourceDescriptor resource : resources) {
+            sb.append("- @").append(resource.serverName()).append(':').append(resource.uri());
+            String displayName = resource.displayName();
+            if (!displayName.equals(resource.uri())) {
+                sb.append(" — ").append(displayName);
+            }
+            if (resource.description() != null && !resource.description().isBlank()) {
+                sb.append("：").append(resource.description());
+            }
+            if (resource.mimeType() != null && !resource.mimeType().isBlank()) {
+                sb.append(" [").append(resource.mimeType()).append(']');
+            }
+            sb.append('\n');
+        }
+        return sb.toString().trim();
     }
 
     public String resources(String serverName) {
@@ -300,10 +388,10 @@ public class McpServerManager implements AutoCloseable {
     }
 
     private void replaceTools(McpServer server, McpClient client, List<McpToolDescriptor> tools) {
-        toolRegistry.replaceMcpToolsForServer(server.name(), tools,
+        toolRegistry.replaceMcpToolOutputsForServer(server.name(), tools,
                 descriptor -> isResourceVirtualTool(descriptor)
-                        ? McpResourceTool.invoker(client, descriptor)
-                        : args -> invokeMcpTool(client, descriptor, args));
+                        ? args -> ToolOutput.text(McpResourceTool.invoker(client, descriptor).apply(args))
+                        : args -> invokeMcpToolOutput(client, descriptor, args));
     }
 
     private boolean isResourceVirtualTool(McpToolDescriptor descriptor) {
@@ -345,11 +433,12 @@ public class McpServerManager implements AutoCloseable {
      * MCP 工具执行入口：把 LLM 给的 JSON 参数透传给 server 的 tools/call，并把异常转成 LLM 可读字符串。
      * 提取成独立方法是为了让 server 维度的错误信息（serverName/toolName）在堆栈和日志里清晰可见。
      */
-    private static String invokeMcpTool(McpClient client, McpToolDescriptor descriptor, String argumentsJson) {
+    private static ToolOutput invokeMcpToolOutput(McpClient client, McpToolDescriptor descriptor, String argumentsJson) {
         try {
-            return client.callTool(descriptor.name(), argumentsJson);
+            return client.callToolOutput(descriptor.name(), argumentsJson);
         } catch (Exception e) {
-            return "MCP 工具调用失败 (" + descriptor.serverName() + "/" + descriptor.name() + "): " + e.getMessage();
+            return ToolOutput.text("MCP 工具调用失败 (" + descriptor.serverName() + "/" + descriptor.name() + "): "
+                    + e.getMessage());
         }
     }
 

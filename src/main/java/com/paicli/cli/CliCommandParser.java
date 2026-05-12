@@ -21,13 +21,23 @@ final class CliCommandParser {
         CONTEXT_STATUS,
         POLICY_STATUS,
         AUDIT_TAIL,
+        SNAPSHOT,
+        RESTORE_SNAPSHOT,
         MCP_LIST,
         MCP_RESTART,
         MCP_LOGS,
         MCP_DISABLE,
         MCP_ENABLE,
         MCP_RESOURCES,
-        MCP_PROMPTS
+        MCP_PROMPTS,
+        BROWSER,
+        TASK,
+        SKILL_LIST,
+        SKILL_SHOW,
+        SKILL_ON,
+        SKILL_OFF,
+        SKILL_RELOAD,
+        CONFIG
     }
 
     record ParsedCommand(CommandType type, String payload) {
@@ -148,12 +158,68 @@ final class CliCommandParser {
             return new ParsedCommand(CommandType.POLICY_STATUS, null);
         }
 
+        if (trimmed.equalsIgnoreCase("/config")) {
+            return new ParsedCommand(CommandType.CONFIG, null);
+        }
+
         if (trimmed.equalsIgnoreCase("/audit")) {
             return new ParsedCommand(CommandType.AUDIT_TAIL, null);
         }
 
         if (trimmed.regionMatches(true, 0, "/audit ", 0, 7)) {
             return new ParsedCommand(CommandType.AUDIT_TAIL, trimmed.substring(7).trim());
+        }
+
+        if (trimmed.equalsIgnoreCase("/snapshot")) {
+            return new ParsedCommand(CommandType.SNAPSHOT, "list");
+        }
+
+        if (trimmed.regionMatches(true, 0, "/snapshot ", 0, 10)) {
+            return new ParsedCommand(CommandType.SNAPSHOT, trimmed.substring(10).trim());
+        }
+
+        if (trimmed.equalsIgnoreCase("/restore")) {
+            return new ParsedCommand(CommandType.RESTORE_SNAPSHOT, null);
+        }
+
+        if (trimmed.regionMatches(true, 0, "/restore ", 0, 9)) {
+            return new ParsedCommand(CommandType.RESTORE_SNAPSHOT, trimmed.substring(9).trim());
+        }
+
+        if (trimmed.equalsIgnoreCase("/browser")) {
+            return new ParsedCommand(CommandType.BROWSER, "status");
+        }
+
+        if (trimmed.regionMatches(true, 0, "/browser ", 0, 9)) {
+            return new ParsedCommand(CommandType.BROWSER, trimmed.substring(9).trim());
+        }
+
+        if (trimmed.equalsIgnoreCase("/task")) {
+            return new ParsedCommand(CommandType.TASK, "list");
+        }
+
+        if (trimmed.regionMatches(true, 0, "/task ", 0, 6)) {
+            return new ParsedCommand(CommandType.TASK, trimmed.substring(6).trim());
+        }
+
+        if (trimmed.equalsIgnoreCase("/skill") || trimmed.equalsIgnoreCase("/skill list")) {
+            return new ParsedCommand(CommandType.SKILL_LIST, null);
+        }
+
+        if (trimmed.equalsIgnoreCase("/skill reload")) {
+            return new ParsedCommand(CommandType.SKILL_RELOAD, null);
+        }
+
+        if (trimmed.regionMatches(true, 0, "/skill show ", 0, 12)) {
+            return new ParsedCommand(CommandType.SKILL_SHOW, trimmed.substring(12).trim());
+        }
+
+        if (trimmed.regionMatches(true, 0, "/skill on ", 0, 10)) {
+            return new ParsedCommand(CommandType.SKILL_ON, trimmed.substring(10).trim());
+        }
+
+        if (trimmed.regionMatches(true, 0, "/skill off ", 0, 11)) {
+            return new ParsedCommand(CommandType.SKILL_OFF, trimmed.substring(11).trim());
         }
 
         if (trimmed.equalsIgnoreCase("/mcp")) {

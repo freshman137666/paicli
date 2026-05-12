@@ -1,6 +1,23 @@
 # PaiCLI
 
-一个成熟的 Java Agent CLI 产品，对标 Claude Code 作者为沉默王二，从第一期的 `ReAct` 单代理循环逐步演进到第十一期的 `MCP 高级能力`。
+一个成熟的 Java Agent CLI 产品，对标 Claude Code 作者为沉默王二，从第一期的 `ReAct` 单代理循环逐步演进到第十六期的 `TUI 产品化`。
+
+当前进度：已完成第 16.1 期 inline 流式 TUI 形态修正、第 17 期 `LSP 诊断注入` MVP、第 18 期 `Git Side-History 快照与回滚` MVP、第 19 期 `Prompt 分层架构` MVP、第 20 期 `异步后台任务 + Runtime API` MVP、第 21 期 `图片复制粘贴输入` MVP。
+
+## 测试策略
+
+日常开发不需要每次都跑全量测试。推荐按改动范围选择：
+
+```bash
+# 第 16 期终端 / TUI / inline renderer 冒烟
+mvn test -Pphase16-smoke
+
+# 常规快速回归，跳过外部进程 / 网络超时 / 命令超时类慢测试
+mvn test -Pquick
+
+# 发版或大范围重构前再跑全量
+mvn test
+```
 
 ## 演进历程
 
@@ -21,10 +38,10 @@
 ### 第三期：Memory + 上下文工程
 
 - 短期记忆管理当前对话与工具结果
-- 长期记忆通过 `/save <事实>` 手动保存关键事实，跨会话复用
+- 长期记忆通过 `/save <事实>` 或用户明确说“记一下 / 记住”时的 `save_memory` 保存关键事实，跨会话复用
 - 注入给模型的相关记忆只使用长期稳定事实，不把当前轮短期对话误当成“历史记忆”
 - 对话接近预算时自动做摘要压缩
-- 新增 `/memory` 查看状态、`/memory clear` 清空长期记忆、`/save` 手动保存事实
+- 新增 `/memory` 查看状态、`/memory clear` 清空长期记忆、`/save` 手动保存事实；Agent 在用户明确说“记一下 / 记住”时可调用 `save_memory`
 
 ### 第四期：RAG 检索 + 代码库理解
 
@@ -45,7 +62,7 @@
 
 ### 第六期：Human-in-the-Loop + 审批流
 
-- 危险操作静态规则识别：`write_file`、`execute_command`、`create_project`
+- 危险操作静态规则识别：`write_file`、`execute_command`、`create_project`、`revert_turn`
 - 三级危险等级：高危（`execute_command`）、中危（`write_file` / `create_project`）
 - 审批决策：批准 / 全部放行 / 拒绝 / 跳过 / 修改参数后执行
 - HITL 默认关闭，通过 `/hitl on` 启用
@@ -62,16 +79,16 @@
 ### 第八期：多模型适配 + 运行时切换
 
 - `LlmClient` 接口抽象 + `AbstractOpenAiCompatibleClient` 模板基类
-- 内置 `GLMClient`、`DeepSeekClient` 两个瘦实现，各约 20 行
-- `/model glm` / `/model deepseek` 运行时切换当前对话模型
-- 配置持久化到 `~/.paicli/config.json`，API Key 从 `.env` 回退读取
+- 内置 `GLMClient`、`DeepSeekClient`、`StepClient`、`KimiClient` 四个瘦实现
+- `/model glm-5.1` / `/model glm-5v-turbo` 明确切 GLM 模型；`/model deepseek` / `/model step` / `/model kimi` 切 provider 并读取配置里的具体模型
+- 配置持久化到 `~/.paicli/config.json`，API Key 可从配置、环境变量或 `.env` 读取
 
 ### 第九期：联网能力 + Web 工具
 
 - `web_search` 抽象成 `SearchProvider` 接口，内置三个实现：智谱 Web Search（默认，与 GLM 共用 Key，0.01–0.05 元/次）、SerpAPI（国际通用付费）、SearXNG（开源自托管免费）
 - `web_fetch` 新工具：URL → OkHttp 抓取 → Jsoup 解析 → 简易 readability → Markdown 正文
 - 默认安全策略：屏蔽 `file://` / 内网 / loopback；30 秒超时；5MB 响应上限；每分钟 30 次限流
-- 边界明确：SPA / 防爬墙站点会返回空正文 + 已知边界提示，不反复重试，留给后续 CDP 路线
+- 边界明确：SPA / 防爬墙站点会返回空正文 + 已知边界提示，Agent 会 fallback 到浏览器 MCP 路线
 
 ### 第十期：MCP 协议核心
 
@@ -79,18 +96,126 @@
 - 启动时读取 `~/.paicli/mcp.json` 与 `.paicli/mcp.json`，项目级配置按 server 名覆盖用户级配置
 - MCP 工具自动注册为 `mcp__{server}__{tool}`，参数 schema 会清洗 `$ref` / `anyOf` / 超长 description，降低模型调用失败率
 - 所有 MCP 工具默认走 HITL 审批和审计，审计参数会脱敏 token / key / password / Authorization / Bearer 凭证
-- CLI 命令：`/mcp`、`/mcp restart <name>`、`/mcp logs <name>`、`/mcp disable <name>`、`/mcp enable <name>`
-- 没有 MCP 配置文件时不会启动外部 server；子系统保持开启，创建配置后重启 PaiCLI 即可加载
-
-### 第十一期：MCP 高级能力（resources 双轨）
-
-- 支持 MCP resources：server 声明 `resources` capability 后，自动注册 `mcp__{server}__list_resources` / `mcp__{server}__read_resource` 两个虚拟工具
+- 支持 MCP resources：server 声明 `resources` capability 后，自动注册 `mcp__{server}__list_resources` / `mcp__{server}__read_resource` 虚拟工具
 - 普通输入支持 `@server:protocol://path` 显式引用 resource，提交给 Agent 前展开为 `<resource>` 内联块
-- JLine 自动补全会基于启动时缓存的 resources 提供 `@...` 候选，不干扰 Plan / Team 的 raw-mode 单键交互
-- 新增 `/mcp resources <server>` 查看资源列表，`/mcp prompts <server>` 查看 prompt 模板
 - 被动处理 `notifications/tools/list_changed`、`notifications/resources/list_changed`、`notifications/resources/updated`
-- 运行中输入 `/cancel` 并回车可请求取消当前 Agent run；ReAct、Plan、Team、工具批次和 `execute_command` 会协同检查取消信号
-- OAuth 与 `sampling/createMessage` 已确认延后，不属于本期交付
+- 运行中输入 `/cancel` 并回车可请求取消当前 Agent run
+- CLI 命令：`/mcp`、`/mcp restart <name>`、`/mcp logs <name>`、`/mcp disable <name>`、`/mcp enable <name>`、`/mcp resources <name>`、`/mcp prompts <name>`
+- `~/.paicli/mcp.json` 不存在时会自动创建默认 chrome-devtools 配置；项目级 `.paicli/mcp.json` 仍可按 server 名覆盖
+
+### 第十二期：长上下文工程
+
+- `LlmClient` 声明模型能力：`maxContextWindow()`、`supportsPromptCaching()`、`promptCacheMode()`
+- GLM-5.1 默认 200k window，DeepSeek V4 默认 1M window，StepFun 默认 256k window，Kimi K2.6 默认 256k window
+- `AgentBudget` 按当前模型动态计算预算，默认 `80% * maxContextWindow`，仍可用系统属性覆盖
+- short / balanced / long 三种上下文模式：长上下文模式跳过摘要压缩，RAG 默认 topK 提升到 20
+- `search_code` 未显式传 `top_k` 时按上下文模式自适应
+- 长上下文模式下自动把 MCP resources 的 URI / 描述索引注入 system prompt，不自动注入正文
+- Token 输出显示 window、动态预算、cached input tokens 和估算成本
+- `/context` 会显示当前上下文模式、prompt cache 模式、RAG topK、resources 自动索引状态
+
+### 第十三期：Chrome DevTools MCP
+
+- 默认接入 Google 官方 `chrome-devtools-mcp@latest`，注册为 `mcp__chrome-devtools__navigate_page`、`take_snapshot`、`click`、`fill_form` 等浏览器工具
+- `~/.paicli/mcp.json` 不存在时启动自动创建模板，默认使用 `--isolated=true` 临时浏览器 profile
+- 用于处理 SPA / JS 渲染 / 防爬墙 / 表单交互页面；微信公众号文章、知乎专栏、推特、小红书等 `web_fetch` 失败站点会引导走浏览器 MCP
+- HITL 的“全部放行”支持 MCP server 维度，连续浏览器操作可对 `chrome-devtools` 一次确认
+- `image` 类型结果会作为图片输入附加到下一轮；文本 fallback 仍保留，用于日志、人类可读摘要和 API 不接受图片时的上下文
+- MCP initialize 默认超时提升到 60 秒，并在长启动期间打印等待进度
+
+### 第十四期：CDP 会话复用 + 登录态访问
+
+- 新增 `/browser status`、`/browser connect [port]`、`/browser disconnect`、`/browser tabs` 命令组，并给 Agent 暴露内部 `browser_connect` / `browser_disconnect` / `browser_status` 工具
+- 默认仍使用 `--isolated=true` 临时浏览器 profile；执行 `/browser connect` 后，运行时把 `chrome-devtools` 切到 `--autoConnect`，复用已在 `chrome://inspect/#remote-debugging` 允许远程调试的登录态 Chrome
+- Agent 遇到登录页、权限不足或明确需要登录态页面时，会先调用 `browser_connect` 自动切到 shared；公开页面如微信公众号文章不提前切换
+- `/browser connect <port>` 保留旧式 CDP 端口兼容路径：先探活 `127.0.0.1:<port>/json/version`，成功后切到 `--browser-url=http://127.0.0.1:<port>`；失败时不会改 MCP 启动参数，并输出 macOS / Windows / Linux 的 Chrome 启动命令
+- 切换 shared / isolated 模式都会清空 `chrome-devtools` 的 server 维度全部放行，避免旧信任跨模式延续
+- shared 模式下 `close_page` 只能关闭 PaiCLI 自己创建的 tab；无法证明是 PaiCLI 创建的 tab 会被策略层拒绝
+- 敏感页面命中规则后，`click` / `fill_form` / `evaluate_script` 等改写型浏览器工具必须单步 HITL 审批，不复用全部放行；读型工具如 `take_snapshot` 仍可继续使用
+- 审计日志为 chrome-devtools 工具追加可选浏览器 metadata：`browser_mode`、`sensitive`、`target_url`，旧格式 JSONL 仍可读取
+
+### 第十五期：Skill 系统 + 内置 web-access skill
+
+把"Agent 该怎么思考"从硬编码 system prompt 抽出，沉淀成可复用单元。每个 Skill 是一个目录：`SKILL.md`（决策手册）+ `references/`（按需读取）+ 可选 `scripts/`（可执行依赖）。
+
+- 三层加载位置（按优先级，后者整体覆盖同名 skill）：jar 内置 < 用户级 `~/.paicli/skills/<name>/` < 项目级 `<project>/.paicli/skills/<name>/`
+- 启动期把启用 skill 的 `name` + `description` 注入三处 Agent 系统提示词索引段（启用上限 20 个，索引段 ≤ 4KB）
+- 内置工具 `load_skill(name)`：LLM 在 system prompt 看到匹配 description 时主动调用，PaiCLI 把 SKILL.md 正文（5KB 截断）写入 `SkillContextBuffer`，下一轮 user message 自动前置注入
+- 内置 web-access skill：决策手册（浏览哲学四步法 + 工具选择表 + 浏览器优先级 + Jina 兜底说明）+ 6 个站点经验文件（mp.weixin / zhuanlan.zhihu / x.com / xiaohongshu / github / juejin）+ cdp-cheatsheet
+- frontmatter 走手写 YAML 子集解析，不引 SnakeYAML；解析失败 stderr 警告但不阻塞启动
+- CLI 命令：`/skill list` / `/skill show <name>` / `/skill on <name>` / `/skill off <name>` / `/skill reload`
+- 启用状态持久化：`~/.paicli/skills.json` 的 `disabled` 列表，默认全启用
+- 与 HITL 协同：Skill 内调用 `execute_command` 等危险工具仍走既有 HITL 审批，沿用 `execute_command` 工具维度全放行；不给 Skill 单独审批维度
+
+设计意图：从「写工具」演进到「打包专家手册」。当工具堆成山（PaiCLI 当前内置 9 个 + MCP 60+ 工具），用 Skill 给 LLM 一份按场景展开的"专家手册"，比往 system prompt 里塞更多规则更可扩展。
+
+### 第十六期：TUI 产品化（v16.1 形态修正后：双形态可切换）
+
+v16.1 抽出 `Renderer` 接口 + 三个实现：
+
+| 形态 | 启用方式 | 视觉风格 |
+|---|---|---|
+| **inline 流式 TUI**（默认） | 直接运行 / `PAICLI_RENDERER=inline` | Claude Code 风格：主屏直出、底部 DECSTBM 状态栏、行内可折叠工具块（`Read 3 files (ctrl+o to expand)`）、行内 git diff、HITL 单字符 `[y/n/a/s/m]` 提示 |
+| **lanterna 全屏 TUI** | `PAICLI_RENDERER=lanterna`（或兼容旧 `PAICLI_TUI=true`） | v16 三栏全屏：文件树 + 对话流 + 状态栏 + 底部输入栏，HITL 模态弹窗 |
+| **plain 兜底** | `PAICLI_RENDERER=plain` | 纯 println，无折叠 / 状态栏，等价 v15 行为 |
+
+- 三种形态共享同一套 `Agent` / `ToolRegistry` / `MemoryManager` / MCP server / SkillRegistry / HITL handler，不创建孤立空会话
+- 普通输入走 ReAct；`/plan <任务>` 走 Plan-and-Execute；`/team <任务>` 走 Multi-Agent；`/cancel` 可取消运行中任务
+- 通用命令：`/clear`、`/context`、`/memory`、`/memory clear`、`/save <事实>`、`/hitl`、`/hitl on`、`/hitl off`、`/config`、`/exit`
+- 对话历史保存到 `~/.paicli/history/session_*.jsonl`
+- 兼容旧设置：`PAICLI_TUI=true` 自动映射为 `PAICLI_RENDERER=lanterna`（已 deprecated）
+- `PAICLI_NO_STATUSBAR=true` 在 inline 模式下禁用底部状态栏（不支持 DECSTBM 的终端）
+- `NO_COLOR=1` 禁用所有 ANSI 颜色，保留布局
+
+### 第十七期：LSP 诊断注入（MVP）
+
+- `write_file` 成功后触发 post-edit 诊断，诊断结果不会阻塞工具主流程
+- 当前 MVP 对 Java 文件使用 JavaParser 做轻量语法诊断，不依赖本机安装 JDT LS
+- ReAct、Plan-and-Execute、Multi-Agent 三条路径都会在下一轮 LLM 请求前注入 pending 诊断
+- 诊断按 error / warning / info、文件、行列号、message 格式化，默认最多注入 20 条
+- 配置：`PAICLI_LSP_ENABLED=false` 可关闭，`PAICLI_LSP_MAX_DIAGNOSTICS=20` 可调整注入上限
+- 后续增强：接入 JDT LS / rust-analyzer / pyright / gopls 的 stdio JSON-RPC transport
+
+### 第十八期：Git Side-History 快照与回滚（MVP）
+
+- 每个 ReAct / Plan / Team turn 开始前创建 `pre-turn` 快照，结束后异步创建 `post-turn` 快照
+- 快照仓库使用 JGit 纯 Java 实现，默认位于 `~/.paicli/snapshots/<project_hash>/<worktree_hash>/.git`，不写用户项目 `.git`
+- `/snapshot` 查看最近快照，`/snapshot status` 查看配置与 side-git 目录，`/snapshot clean` 清理当前项目快照目录
+- `/restore <N>` 恢复到最近第 N 个 `pre-turn` 快照；恢复前会先创建 `pre-restore` 快照
+- Agent 内置 `revert_turn` 工具，纳入 HITL 与 AuditLog 危险工具链
+- 配置：`PAICLI_SNAPSHOT_ENABLED=false` 可关闭，`PAICLI_SNAPSHOT_MAX=50`、`PAICLI_SNAPSHOT_EXCLUDES=...`、`PAICLI_SNAPSHOT_DIR=...` 可调整策略
+
+### 第十九期：Prompt 分层架构（MVP）
+
+- ReAct、Plan task executor、Multi-Agent 三角色、Planner 的 system prompt 已从 Java 硬编码抽离到 `src/main/resources/prompts/`
+- `PromptAssembler` 按 `base -> personality -> mode -> approval -> project_context -> skills -> context_mgmt -> handoff` 组装，动态上下文靠后注入
+- 支持用户级覆盖 `~/.paicli/prompts/...`，支持项目级覆盖 `.paicli/prompts/...`，项目级优先级最高
+- 覆盖是整文件替换；`base.md` 和最终 prompt 必须包含 `## Language`
+- Prompt 改动审计模板见 `docs/prompt-analysis-template.md`
+
+### 第二十期：异步后台任务 + Runtime API（MVP）
+
+- `DurableTaskManager` 使用 SQLite 持久化后台任务队列，默认位置 `~/.paicli/tasks/tasks.db`
+- 任务生命周期：`enqueued -> running -> completed / failed / canceled`
+- `/task`、`/task add <任务内容>`、`/task cancel <task_id>`、`/task log <task_id>` 提供 CLI 闭环
+- Worker Pool 默认 2 个后台 worker，可通过 `PAICLI_TASK_WORKERS` 调整
+- `java -jar target/paicli-1.0-SNAPSHOT.jar serve --http --port 8080` 启动 localhost Runtime API
+- Runtime API 端点：`POST /v1/threads`、`POST /v1/threads/{id}/turns`、`GET /v1/threads/{id}/events`
+- Runtime API 强制要求 `PAICLI_RUNTIME_API_KEY` 或 `-Dpaicli.runtime.api.key`
+- 详细文档见 `docs/phase-20-runtime-api.md`
+
+### 第二十一期：图片复制粘贴输入（MVP）
+
+- `LlmClient.Message` 支持 `ContentPart`，包括 `text`、`image_base64`、`image_url`
+- 请求体在含图片时输出带图片块的 content array，纯文本仍保持 string content
+- `LlmClient` 公共接口不做图片能力声明；输入层只负责读取、压缩、附加图片，provider API 负责最终接收或返回错误
+- GLM 套餐用户可通过 `/model glm-5v-turbo` 切换到 GLM-5V-Turbo 多模态模型，再用 Ctrl+V 或 `@image:` 输入图片；本地 base64 图片会按智谱格式写入 `image_url.url`
+- MCP `image` content 会保留 base64 与 `mimeType`，在 ReAct / Plan / SubAgent 工具结果后作为图片 user message 回灌
+- 用户可通过 `@image:file:///abs/path.png`、`@image:/abs/path.png` 或 `@image:relative/path.png` 引用本地图片
+- 本地图片和 MCP 图片都会按 Claude Code 同类策略预处理：不是 OCR 成文本，而是压缩 / 缩放后作为图片块发送；带 alpha 的 PNG 会铺白底重编码；额外注入来源、尺寸和坐标映射元信息
+- 本地 `@image:` 消息会要求模型优先分析本轮图片；除非用户明确要求结合历史，历史对话和历史工具结果不能替代当前图片内容
+- 新一轮 ReAct / SubAgent 任务开始前会省略历史 image payload，仅保留文本元信息，避免旧截图反复进入上下文；模型 `reasoning_content` 只写日志 / 展示，不回传进下一轮请求历史
+- 当前边界：不做视频 / 音频、图像生成、TUI sixel 图片预览
 
 ### 第六期 HITL 增强（路径围栏 / 命令快速拒绝 / 操作审计）
 
@@ -98,7 +223,7 @@
 
 - `PathGuard` 路径围栏：文件类工具强制限定在项目根之内，拦截绝对路径外逃 / `..` 穿越 / 符号链接逃逸
 - `CommandGuard` 命令快速拒绝：HITL 之前的 fast-fail 黑名单（`sudo` / `rm -rf 全盘` / `mkfs` / `dd of=/dev` / fork bomb / `curl|sh` / `find /` / `chmod 777 /` / `shutdown`），减少 HITL 弹窗骚扰
-- `AuditLog` 结构化审计：危险工具调用按天写 JSONL 到 `~/.paicli/audit/`，含 `outcome (allow|deny|error)` 与 `approver (hitl|policy|none)`
+- `AuditLog` 结构化审计：危险工具调用按天写 JSONL 到 `~/.paicli/audit/`，含 `outcome (allow|deny|error)` 与 `approver (hitl|policy|none)`；`revert_turn` 也纳入危险工具链
 - `write_file` 单文件 5MB 上限
 - CLI 命令：`/policy` 查看安全策略状态、`/audit [N]` 看最近 N 条审计
 
@@ -120,7 +245,7 @@
 ║   ██║     ██║  ██║██║╚██████╗███████╗██║                ║
 ║   ╚═╝     ╚═╝  ╚═╝╚═╝ ╚═════╝╚══════╝╚═╝                ║
 ║                                                          ║
-║      MCP-Native Agent CLI v11.0.0                     ║
+║      Terminal-First Agent IDE v16.1.0                ║
 ║                                                          ║
 ╚══════════════════════════════════════════════════════════╝
 
@@ -149,6 +274,7 @@
 
 - 🧠 短期记忆、长期记忆与相关记忆检索
 - 📦 长对话摘要压缩与 Token 预算管理
+- 🧮 长上下文动态预算、prompt cache 可见化与成本估算
 - 💾 `/memory` 与 `/save` 记忆管理入口
 
 ### 第四期
@@ -167,7 +293,7 @@
 
 ### 第六期
 
-- 🔒 危险操作静态规则识别（`write_file` / `execute_command` / `create_project`）
+- 🔒 危险操作静态规则识别（`write_file` / `execute_command` / `create_project` / `revert_turn`）
 - ⚠️ 三级危险等级展示（高危 / 中危 / 安全）
 - ✅ 审批决策：批准、全部放行、拒绝、跳过、修改参数后执行
 - 🔓 HITL 默认关闭，`/hitl on` 启用、`/hitl off` 关闭
@@ -181,7 +307,7 @@
 
 ### 第八期
 
-- 🔄 GLM-5.1 与 DeepSeek V4 双模型，`/model glm` / `/model deepseek` 运行时切换
+- 🔄 GLM-5.1、GLM-5V-Turbo、DeepSeek V4、阶跃星辰 StepFun 与 Kimi K2.6 多模型，`/model glm-5.1` / `/model glm-5v-turbo` 明确切 GLM 模型，`/model deepseek` / `/model step` / `/model kimi` 读取配置模型
 - 🧱 `LlmClient` 接口 + 模板方法基类，新增 provider 只需 ~20 行
 - 💾 默认模型持久化到 `~/.paicli/config.json`
 
@@ -200,18 +326,11 @@
 - 📋 结构化审计：危险工具调用按天写一行 JSONL 到 `~/.paicli/audit/`，可通过 `/audit [N]` 查看
 - 🧱 定位：HITL 之外的辅助层，不是沙箱、不提供进程隔离
 
-### 第十一期
-
-- 📚 MCP resources 双轨：模型可调用 `mcp__{server}__list_resources` / `mcp__{server}__read_resource`，用户也可手动输入 `@server:protocol://path`
-- ⌨️ 普通输入支持 resource 自动补全，Plan / Team 审阅的 raw-mode 单键交互保持不变
-- 🧩 `/mcp prompts <server>` 查看 server 暴露的 prompts，但不自动注入对话
-- 🔄 被动响应 MCP list_changed / resources updated 通知，刷新工具列表或让 resource cache 失效
-
 ## 快速开始
 
 ### 1. 配置 API Key
 
-复制 `.env.example` 为 `.env`，并填入你的 GLM API Key：
+复制 `.env.example` 为 `.env`，并填入你的 GLM、DeepSeek、StepFun 或 Kimi API Key：
 
 ```bash
 cp .env.example .env
@@ -222,12 +341,19 @@ cp .env.example .env
 
 ```bash
 export GLM_API_KEY=your_api_key_here
+# 或
+export STEP_API_KEY=your_step_api_key_here
+export STEP_MODEL=step-3.5-flash
+# 或
+export KIMI_API_KEY=your_kimi_api_key_here
+export KIMI_MODEL=kimi-k2.6
 ```
 
 长期记忆默认保存在用户目录下的 `~/.paicli/memory/long_term_memory.json`。
-长期记忆只保存你显式通过 `/save` 写入的稳定事实，不应包含一次性任务请求或临时文件名/目录名。
+长期记忆只保存显式保存意图下的稳定事实：`/save <事实>`，或用户在自然语言里明确说“记一下 / 记住 / 以后记得”时由 Agent 调用 `save_memory`。它不应包含一次性任务请求或临时文件名/目录名。
 代码索引默认保存在 `~/.paicli/rag/codebase.db`。
 调试日志默认滚动写入 `~/.paicli/logs/paicli.log`，旧日志会按保留天数和总容量自动清理。
+ReAct / Plan task / SubAgent / Planner 的模型 `reasoning_content` 会以 `LLM reasoning [...]` 形式写入该日志，便于排查模型为什么选择某个工具或路径。
 
 如果你想为某次运行指定单独目录，可以额外传入：
 
@@ -259,7 +385,20 @@ PAICLI_LOG_TOTAL_SIZE_CAP=100MB
 
 ### 2. 可选：配置 MCP server
 
-MCP 子系统默认开启。没有配置文件时不会启动外部 server；需要接入时创建 `~/.paicli/mcp.json` 或项目内 `.paicli/mcp.json`：
+MCP 子系统默认开启。`~/.paicli/mcp.json` 不存在时，PaiCLI 会自动创建默认 chrome-devtools 配置：
+
+```json
+{
+  "mcpServers": {
+    "chrome-devtools": {
+      "command": "npx",
+      "args": ["-y", "chrome-devtools-mcp@latest", "--isolated=true"]
+    }
+  }
+}
+```
+
+需要继续接入其他 server 时，可编辑 `~/.paicli/mcp.json` 或项目内 `.paicli/mcp.json`：
 
 ```json
 {
@@ -281,6 +420,48 @@ MCP 子系统默认开启。没有配置文件时不会启动外部 server；需
 ```
 
 `command` 表示 stdio server，`url` 表示 Streamable HTTP server。`${PROJECT_DIR}` / `${HOME}` 是内置变量，其他 `${VAR}` 从环境变量读取；缺失会在启动时直接提示。
+
+需要复用当前登录态时，Chrome 144+ 推荐打开 `chrome://inspect/#remote-debugging` 并勾选 `Allow remote debugging for this browser instance`。旧版本或需要显式 CDP 端口时，可以启动带远程调试端口和独立 user-data-dir 的 Chrome，并在这个调试 Chrome 中完成登录：
+
+```bash
+# macOS
+open -na "Google Chrome" --args --remote-debugging-port=9222 --user-data-dir=/tmp/paicli-chrome-profile
+
+# Windows
+start chrome.exe --remote-debugging-port=9222 --user-data-dir=%TEMP%\paicli-chrome-profile
+
+# Linux
+google-chrome --remote-debugging-port=9222 --user-data-dir=/tmp/paicli-chrome-profile
+```
+
+通常不需要用户预先切换；Agent 如果遇到登录页会自己调用 `browser_connect`。手工调试时也可以在 PaiCLI 内执行：
+
+```text
+/browser status
+/browser connect
+/browser tabs
+/browser disconnect
+```
+
+`/browser connect` 只在当前进程内把 `chrome-devtools` 切到 shared 模式，不会改写 `~/.paicli/mcp.json`。如果希望启动后默认 shared，可手动把 args 改为：
+
+```json
+["-y", "chrome-devtools-mcp@latest", "--autoConnect"]
+```
+
+旧式 CDP HTTP JSON 端口也可使用：
+
+```json
+["-y", "chrome-devtools-mcp@latest", "--browser-url=http://127.0.0.1:9222"]
+```
+
+浏览器测试可直接让 Agent 读取动态页面，例如：
+
+```text
+帮我看下 https://mp.weixin.qq.com/s/RB7kF_BbsJZ5_Hmu9PxWdg 这篇文章讲了什么
+```
+
+期望路径是 `web_fetch` 尝试失败后，fallback 到 `mcp__chrome-devtools__navigate_page` 与 `take_snapshot`。
 
 如果 server 支持 resources，可以直接查看或引用：
 
@@ -351,20 +532,11 @@ mvn clean compile exec:java -Dexec.mainClass="com.paicli.cli.Main"
 ```text
 💡 提示:
    - 输入你的问题或任务
-   - 输入 '/plan' 后，下一条任务使用 Plan-and-Execute 模式
-   - 输入 '/plan 任务内容' 直接用计划模式执行这条任务
-   - 输入 '/team' 后，下一条任务使用 Multi-Agent 协作模式
-   - 输入 '/team 任务内容' 直接用多 Agent 协作执行这条任务
-   - 计划生成后可直接执行、补充要求重规划，或取消
-   - 输入 '/index [路径]' 为代码库建立向量索引
-   - 输入 '/search <查询>' 语义检索代码
-   - 输入 '/graph <类名>' 查看代码关系图谱
-   - 输入 '/memory' 查看记忆状态
-   - 输入 '/memory clear' 清空长期记忆
-   - 输入 '/save 事实内容' 手动保存关键事实
+   - 输入 '/' 查看命令
+   - 输入 '@server:protocol://path' 可显式引用 MCP resource
+   - 任务运行中按 ESC 取消当前任务
+   - 默认模式是 ReAct
    - 未识别的 `/xxx` 命令会直接提示“未知命令”，不会再交给 Agent 当普通对话处理
-   - 输入 '/clear' 清空对话历史
-   - 输入 '/exit' 或 '/quit' 退出
 
 👤 你: /plan 创建一个名为 demoapp 的 java 项目，然后读取 pom.xml，最后验证项目结构
 
@@ -406,12 +578,13 @@ I
 - `search_code` - 语义检索代码库（自然语言查询）
 - `web_search` - 搜索互联网获取实时信息
 - `web_fetch` - 抓取已知 URL 并提取正文 Markdown
+- `revert_turn` - 恢复到最近第 N 个 pre-turn 快照（走 HITL 与审计）
 - `mcp__{server}__{tool}` - MCP server 动态提供的外部工具
 - `mcp__{server}__list_resources` / `mcp__{server}__read_resource` - 支持 resources 的 MCP server 自动注册的虚拟工具
 
 同一轮模型返回多个工具调用时，PaiCLI 会并行执行这些工具；如果工具之间有依赖关系，模型应分多轮调用。
 
-文件类工具（`read_file` / `write_file` / `list_dir` / `create_project`）路径强制限定在项目根之内，越界请求会被策略层拒绝；`execute_command` 通过命令黑名单拦截 `sudo` / `rm -rf 全盘` / `mkfs` / `dd of=/dev` / fork bomb / `curl|sh` 等。所有 `mcp__` 前缀工具默认触发 HITL 和审计。详见 `/policy`。
+文件类工具（`read_file` / `write_file` / `list_dir` / `create_project`）路径强制限定在项目根之内，越界请求会被策略层拒绝；`execute_command` 通过命令黑名单拦截 `sudo` / `rm -rf 全盘` / `mkfs` / `dd of=/dev` / fork bomb / `curl|sh` 等。`revert_turn` 会批量回写工作区，默认触发 HITL 和审计。所有 `mcp__` 前缀工具默认触发 HITL 和审计。详见 `/policy`。
 
 ## 命令
 
@@ -432,9 +605,14 @@ I
 - `/mcp prompts <name>` - 查看 MCP server 暴露的 prompts（只查看，不注入对话）
 - `/policy` - 查看安全策略状态（路径围栏 / 命令黑名单 / 资源上限 / 审计目录）
 - `/audit [N]` - 查看今日最近 N 条危险工具审计记录（默认 10）
+- `/snapshot` - 查看最近 Side-Git 快照
+- `/snapshot status` - 查看 Side-Git 快照状态
+- `/snapshot clean` - 清理当前项目 Side-Git 快照目录
+- `/restore <N>` - 恢复到最近第 N 个 pre-turn 快照
 - `/memory` / `/mem` - 查看记忆系统状态
 - `/memory clear` - 清空长期记忆
 - `/save <事实>` - 手动保存关键事实到长期记忆
+- `save_memory` - Agent 内置工具，仅在用户明确要求保存长期偏好或稳定事实时调用；“复用已登录 Chrome，记一下”这类浏览器登录态偏好会写入长期记忆，供新会话检索
 - `/index [路径]` - 索引代码库（默认当前目录）
 - `/search <查询>` - 语义检索代码
 - `/graph <类名>` - 查看代码关系图谱
@@ -482,20 +660,10 @@ I
 
 💡 提示:
    - 输入你的问题或任务
-   - 输入 '/plan' 后，下一条任务使用 Plan-and-Execute 模式
-   - 输入 '/plan 任务内容' 直接用计划模式执行这条任务
-   - 输入 '/team' 后，下一条任务使用 Multi-Agent 协作模式
-   - 输入 '/team 任务内容' 直接用多 Agent 协作执行这条任务
-   - 计划生成后可直接执行、补充要求重规划，或取消
-   - 输入 '/index [路径]' 为代码库建立向量索引
-   - 输入 '/search <查询>' 语义检索代码
-   - 输入 '/graph <类名>' 查看代码关系图谱
+   - 输入 '/' 查看命令
+   - 输入 '@server:protocol://path' 可显式引用 MCP resource
+   - 任务运行中按 ESC 取消当前任务
    - 默认模式是 ReAct
-   - 输入 '/clear' 清空对话历史
-   - 输入 '/memory' 查看记忆状态
-   - 输入 '/memory clear' 清空长期记忆
-   - 输入 '/save 事实内容' 手动保存关键事实
-   - 输入 '/exit' 或 '/quit' 退出
 
 👤 你: 你好，请列出当前目录的文件
 
@@ -539,7 +707,14 @@ src/main/java/com/paicli
 │   ├── CliCommandParser.java   # 命令解析
 │   └── PlanReviewInputParser.java  # 计划审核输入
 ├── llm/
-│   └── GLMClient.java          # GLM-5.1 API 客户端
+│   ├── GLMClient.java          # GLM API 客户端；glm-5.1 走 Coding endpoint，glm-5v-turbo 走多模态 endpoint
+│   ├── DeepSeekClient.java     # DeepSeek API 客户端
+│   ├── StepClient.java         # 阶跃星辰 StepFun API 客户端
+│   └── KimiClient.java         # Kimi / Moonshot API 客户端
+├── context/
+│   ├── ContextMode.java        # short / balanced / long 模式
+│   ├── ContextProfile.java     # 模型窗口与上下文策略
+│   └── TokenUsageFormatter.java # Token / cache / 成本展示
 ├── memory/
 │   ├── MemoryEntry.java        # 记忆条目
 │   ├── ConversationMemory.java # 短期记忆

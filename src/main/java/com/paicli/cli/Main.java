@@ -3,16 +3,29 @@ package com.paicli.cli;
 import com.paicli.agent.Agent;
 import com.paicli.agent.AgentOrchestrator;
 import com.paicli.agent.PlanExecuteAgent;
+import com.paicli.browser.BrowserAuditMetadata;
+import com.paicli.browser.BrowserConnectivityCheck;
+import com.paicli.browser.BrowserGuard;
+import com.paicli.browser.BrowserMode;
+import com.paicli.browser.BrowserSession;
+import com.paicli.browser.SensitivePagePolicy;
 import com.paicli.config.PaiCliConfig;
 import com.paicli.eval.EvalRunRecorder;
 import com.paicli.hitl.HitlHandler;
 import com.paicli.hitl.HitlToolRegistry;
 import com.paicli.hitl.ScriptedHitlHandler;
+import com.paicli.hitl.SwitchableHitlHandler;
+import com.paicli.hitl.RendererHitlHandler;
 import com.paicli.hitl.TerminalHitlHandler;
 import com.paicli.llm.LlmClient;
 import com.paicli.llm.LlmClientFactory;
+import com.paicli.render.Renderer;
+import com.paicli.render.RendererFactory;
+import com.paicli.render.inline.InlineRenderer;
+import com.paicli.image.ClipboardImage;
+import com.paicli.mcp.McpServer;
 import com.paicli.mcp.McpServerManager;
-import com.paicli.mcp.mention.AtMentionCompleter;
+import com.paicli.mcp.McpServerStatus;
 import com.paicli.mcp.mention.AtMentionExpander;
 import com.paicli.plan.ExecutionPlan;
 import com.paicli.rag.CodeIndex;
@@ -23,6 +36,14 @@ import com.paicli.rag.CodeRelation;
 import com.paicli.rag.SearchResultFormatter;
 import com.paicli.runtime.CancellationContext;
 import com.paicli.runtime.CancellationToken;
+import com.paicli.runtime.api.RuntimeApiServer;
+import com.paicli.runtime.api.RuntimeThreadStore;
+import com.paicli.runtime.task.DurableTaskManager;
+import com.paicli.runtime.task.TaskCommandFormatter;
+import com.paicli.snapshot.RestoreResult;
+import com.paicli.snapshot.SnapshotService;
+import com.paicli.snapshot.TurnSnapshot;
+import com.paicli.tool.ToolRegistry;
 import org.jline.terminal.Terminal;
 import org.jline.terminal.TerminalBuilder;
 import org.jline.terminal.Attributes;
@@ -32,7 +53,9 @@ import org.jline.reader.MaskingCallback;
 import org.jline.reader.EndOfFileException;
 import org.jline.reader.History;
 import org.jline.reader.UserInterruptException;
+import org.jline.reader.Reference;
 import org.jline.utils.NonBlockingReader;
+import org.jline.keymap.KeyMap;
 
 import java.io.BufferedReader;
 import java.io.File;
@@ -40,23 +63,32 @@ import java.io.FileReader;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CancellationException;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
- * PaiCLI v11.0.0 - MCP-Native Agent CLI
- * 支持 ReAct、Plan-and-Execute、Memory、RAG、Multi-Agent、HITL、并行工具调用、多模型切换、MCP
- * 第 11 期新增：MCP resources 双轨、@-mention resource 引用、prompts 查看、被动通知处理、运行中取消
+ * PaiCLI v16.1.0 - Terminal-First Agent IDE
+ * 支持 ReAct、Plan-and-Execute、Memory、RAG、Multi-Agent、HITL、并行工具调用、多模型切换、MCP、CDP 会话复用
+ * 第 15 期新增：Skill 系统（三层加载 + load_skill 工具 + SkillContextBuffer 注入）、内置 web-access skill
+ * 第 16 期新增：TUI 界面（Lanterna 3）、文件树浏览、代码高亮、对话历史可视化、配置管理面板
+ * 第 16.1 期形态修正：抽出 Renderer 接口 + 三个实现（inline/lanterna/plain），默认形态切换为 inline 流式 TUI（Claude Code 风格）
+ *   - inline 流式：底部 DECSTBM 状态栏、行内可折叠工具块、行内 git diff、单字符 HITL 提示、命令 palette
+ *   - lanterna：保留 phase-16 全屏窗口（向后兼容 PAICLI_TUI=true）
+ *   - plain：纯 println 兜底
  * HITL 增强：路径围栏（PathGuard）、命令快速拒绝（CommandGuard）、操作审计链（AuditLog）—— 见 com.paicli.policy
  */
 public class Main {
-    private static final String VERSION = "11.0.0";
+    private static final String VERSION = "16.1.0";
     private static final String ENV_FILE = ".env";
     private static final String LOG_DIR_PROPERTY = "paicli.log.dir";
     private static final String LOG_LEVEL_PROPERTY = "paicli.log.level";
@@ -70,6 +102,16 @@ public class Main {
     private static final String APP_ARROW_UP = "OA";
     private static final String APP_ARROW_DOWN = "OB";
     private static final int CTRL_O = 15;
+    private static final String DEFAULT_CHROME_DEVTOOLS_MCP_JSON = """
+            {
+              "mcpServers": {
+                "chrome-devtools": {
+                  "command": "npx",
+                  "args": ["-y", "chrome-devtools-mcp@latest", "--isolated=true"]
+                }
+              }
+            }
+            """;
 
     enum EscapeSequenceType {
         STANDALONE_ESC,
@@ -142,6 +184,12 @@ public class Main {
                 evalInputFile = args[++i];
             }
         }
+        configureAwtForCli();
+        if (isRuntimeServeCommand(args)) {
+            configureLogging();
+            startRuntimeApiAndBlock(args);
+            return;
+        }
 
         printBanner();
         configureLogging();
@@ -150,19 +198,53 @@ public class Main {
         LlmClient llmClient = LlmClientFactory.createFromConfig(config);
         if (llmClient == null) {
             System.err.println("❌ 错误: 未找到可用的 API Key");
-            System.err.println("请在 .env 文件中添加 GLM_API_KEY 或 DEEPSEEK_API_KEY");
+            System.err.println("请在 .env 文件中添加 GLM_API_KEY、DEEPSEEK_API_KEY、STEP_API_KEY 或 KIMI_API_KEY");
             System.exit(1);
         }
+        AtomicReference<LlmClient> llmClientRef = new AtomicReference<>(llmClient);
 
         System.out.println("✅ 已加载模型: " + llmClient.getModelName() + " (" + llmClient.getProviderName() + ")\n");
 
-        try (Terminal terminal = TerminalBuilder.builder().system(true).build()) {
-            HitlHandler hitlHandler = createHitlHandler();
+        try (Terminal terminal = TerminalBuilder.builder().system(true).dumb(true).build()) {
+            HitlHandler initialHitlHandler = createHitlHandler();
+            TerminalHitlHandler terminalHitlHandler = initialHitlHandler instanceof TerminalHitlHandler terminalHitl
+                    ? terminalHitl
+                    : new TerminalHitlHandler(false);
+            SwitchableHitlHandler hitlHandler = new SwitchableHitlHandler(initialHitlHandler);
             HitlToolRegistry hitlToolRegistry = new HitlToolRegistry(hitlHandler);
+            BrowserSession browserSession = new BrowserSession();
+            BrowserConnectivityCheck browserConnectivityCheck = new BrowserConnectivityCheck();
+            hitlToolRegistry.setBrowserGuard(new BrowserGuard(browserSession, new SensitivePagePolicy()));
             McpServerManager mcpServerManager = new McpServerManager(hitlToolRegistry, Path.of("."));
+            hitlToolRegistry.setBrowserConnector(new com.paicli.browser.BrowserConnector() {
+                @Override
+                public String status() {
+                    return handleBrowserCommand("status", browserSession, browserConnectivityCheck,
+                            mcpServerManager, hitlToolRegistry, hitlHandler);
+                }
+
+                @Override
+                public String connectDefault() {
+                    return handleBrowserCommand("connect", browserSession, browserConnectivityCheck,
+                            mcpServerManager, hitlToolRegistry, hitlHandler);
+                }
+
+                @Override
+                public String disconnect() {
+                    return handleBrowserCommand("disconnect", browserSession, browserConnectivityCheck,
+                            mcpServerManager, hitlToolRegistry, hitlHandler);
+                }
+            });
             try {
+                McpConfigBootstrapResult bootstrapResult = ensureDefaultMcpConfig(Path.of(System.getProperty("user.home")));
+                if (!bootstrapResult.message().isBlank()) {
+                    System.out.println(bootstrapResult.message());
+                }
                 mcpServerManager.loadConfiguredServers();
-                mcpServerManager.startAll();
+                if (!mcpServerManager.servers().isEmpty()) {
+                    System.out.println("🔌 启动 MCP server（" + mcpServerManager.servers().size() + " 个）...");
+                }
+                mcpServerManager.startAll(System.out);
                 Runtime.getRuntime().addShutdownHook(new Thread(mcpServerManager::close, "paicli-mcp-shutdown"));
                 System.out.println(mcpServerManager.startupSummary());
                 System.out.println();
@@ -172,12 +254,40 @@ public class Main {
             }
             LineReader lineReader = LineReaderBuilder.builder()
                     .terminal(terminal)
-                    .completer(new AtMentionCompleter(mcpServerManager::resourceCandidates))
+                    .completer(new PaiCliCompleter(mcpServerManager::resourceCandidates))
                     .build();
             lineReader.option(LineReader.Option.BRACKETED_PASTE, true);
+            lineReader.option(LineReader.Option.AUTO_LIST, true);
+            lineReader.option(LineReader.Option.AUTO_MENU, true);
+            configureSlashCommandHint(lineReader);
             AtMentionExpander mentionExpander = new AtMentionExpander(mcpServerManager);
 
+            // === Skill 系统初始化 ===
+            Path home = Path.of(System.getProperty("user.home"));
+            Path skillsCacheDir = home.resolve(".paicli/skills-cache");
+            Path userSkillsDir = home.resolve(".paicli/skills");
+            Path projectSkillsDir = Path.of(".paicli/skills").toAbsolutePath();
+            try {
+                new com.paicli.skill.SkillBuiltinExtractor(skillsCacheDir).extractAll();
+            } catch (Exception e) {
+                System.err.println("⚠️ 内置 skill 解压失败: " + e.getMessage());
+            }
+            com.paicli.skill.SkillStateStore skillStateStore = new com.paicli.skill.SkillStateStore(home.resolve(".paicli/skills.json"));
+            com.paicli.skill.SkillRegistry skillRegistry = new com.paicli.skill.SkillRegistry(
+                    skillsCacheDir, userSkillsDir, projectSkillsDir, skillStateStore);
+            skillRegistry.reload();
+            com.paicli.skill.SkillContextBuffer skillContextBuffer = new com.paicli.skill.SkillContextBuffer();
+            hitlToolRegistry.setSkillRegistry(skillRegistry);
+            hitlToolRegistry.setSkillContextBuffer(skillContextBuffer);
+            System.out.println(SkillCommandHandler.startupSummary(skillRegistry));
+
             Agent reactAgent = new Agent(llmClient, hitlToolRegistry);
+            reactAgent.setExternalContextSupplier(mcpServerManager::resourceIndexForPrompt);
+            reactAgent.setSkillRegistry(skillRegistry);
+            reactAgent.setSkillContextBuffer(skillContextBuffer);
+            DurableTaskManager taskManager = openTaskManager(llmClientRef);
+            taskManager.start();
+            Runtime.getRuntime().addShutdownHook(new Thread(taskManager::close, "paicli-task-shutdown"));
             System.out.println("🔄 使用 ReAct 模式\n");
 
             if (evalInputFile != null) {
@@ -185,15 +295,49 @@ public class Main {
                 return;
             }
 
+            printStartupHints();
             boolean nextTaskUsePlanMode = false;
             boolean nextTaskUseTeamMode = false;
 
-            printStartupHints();
+            // === TUI / CLI 分支判断 ===
+            // 旧 PAICLI_TUI=true 路径仍走 Lanterna 全屏 TUI（Day 5 后由 LanternaRenderer 接管）。
+            if (com.paicli.tui.TuiBootstrap.shouldUseTui(terminal)) {
+                try {
+                    com.paicli.tui.TuiBootstrap.launch(config, llmClient, reactAgent, hitlHandler);
+                    return;  // TUI 启动成功，不进入 CLI 循环
+                } catch (Exception e) {
+                    hitlHandler.setDelegate(terminalHitlHandler);
+                    System.err.println("❌ TUI 启动失败，降级到 CLI: " + e.getMessage());
+                    e.printStackTrace();
+                    // 降级到 CLI 继续执行
+                }
+            }
+
+            // === 渲染器抽象（Day 1） ===
+            // PlainRenderer 是 Day 1 的兜底实现；inline / lanterna 在 Day 2 / Day 5 各自落地后接入。
+            Renderer renderer = RendererFactory.create(RendererFactory.resolveMode(), terminal);
+            RendererHitlHandler rendererHitl = new RendererHitlHandler(renderer, hitlHandler.isEnabled());
+            hitlHandler.setDelegate(rendererHitl);
+            reactAgent.setRenderer(renderer);
+            reactAgent.setHitlEnabledSupplier(hitlHandler::isEnabled);
+            reactAgent.getToolRegistry().setWriteFileObserver(
+                    (path, ba) -> renderer.appendDiff(path, ba[0], ba[1]));
+            renderer.start();
+
+            // Day 3：inline 模式绑 Ctrl+O 到 BlockRegistry.toggleLast 实现折叠块展开/收起
+            boolean spaciousPrompt = false;
+            if (renderer instanceof InlineRenderer inline) {
+                bindCtrlOToFoldableBlocks(lineReader, inline);
+            }
+            spaciousPrompt = defaultSpaciousPrompt(spaciousPrompt);
+            bindCtrlVToClipboardImage(lineReader);
+            bindEscToClearInput(lineReader);
 
             while (true) {
                 PromptInput promptInput;
                 try {
-                    promptInput = readPromptInput(terminal, lineReader, nextTaskUsePlanMode || nextTaskUseTeamMode);
+                    promptInput = readPromptInput(terminal, lineReader,
+                            nextTaskUsePlanMode || nextTaskUseTeamMode, spaciousPrompt);
                 } catch (UserInterruptException e) {
                     continue;  // Ctrl+C 跳过
                 } catch (EndOfFileException e) {
@@ -222,7 +366,7 @@ public class Main {
                 switch (command.type()) {
                     case UNKNOWN_COMMAND -> {
                         System.out.println("❌ 未知命令: " + command.payload());
-                        System.out.println("可用命令：/model /plan /team /hitl /mcp /mcp resources /mcp prompts /policy /audit /clear /context /memory /memory clear /save /index /search /graph /exit\n");
+                        printSlashCommandHelp();
                         continue;
                     }
                     case EXIT -> {
@@ -286,22 +430,32 @@ public class Main {
                         input = command.payload();
                     }
                     case SWITCH_MODEL -> {
-                        String provider = command.payload();
-                        if (provider == null || provider.isEmpty()) {
+                        String selection = command.payload();
+                        if (selection == null || selection.isEmpty()) {
                             System.out.println("🤖 当前模型: " + llmClient.getModelName() + " (" + llmClient.getProviderName() + ")");
-                            System.out.println("   可用模型：glm, deepseek");
-                            System.out.println("   /model glm     - 切换到 GLM-5.1");
-                            System.out.println("   /model deepseek - 切换到 DeepSeek V4\n");
+                            System.out.println("   GLM 明确模型：");
+                            System.out.println("   /model glm-5.1       - 切换到 GLM-5.1");
+                            System.out.println("   /model glm-5v-turbo  - 切换到 GLM-5V-Turbo 多模态");
+                            System.out.println("   其它 provider 使用你配置里的具体模型：");
+                            System.out.println("   /model deepseek      - 切换到 DeepSeek（读取配置模型）");
+                            System.out.println("   /model step          - 切换到 StepFun（读取配置模型）");
+                            System.out.println("   /model kimi          - 切换到 Kimi（读取配置模型）\n");
                         } else {
-                            LlmClient newClient = LlmClientFactory.create(provider, config);
+                            ModelSelection target = resolveModelSelection(selection);
+                            if (target.explicitModel()) {
+                                ensureProviderConfig(config, target.provider()).setModel(target.model());
+                            }
+                            LlmClient newClient = LlmClientFactory.create(target.provider(), config);
                             if (newClient == null) {
-                                System.out.println("❌ 切换失败：未配置 " + provider + " 的 API Key\n");
+                                System.out.println("❌ 切换失败：未配置 " + target.provider() + " 的 API Key\n");
                             } else {
                                 llmClient = newClient;
-                                config.setDefaultProvider(provider);
+                                llmClientRef.set(newClient);
+                                config.setDefaultProvider(target.provider());
                                 config.save();
                                 reactAgent.setLlmClient(llmClient);
                                 System.out.println("✅ 已切换到: " + llmClient.getModelName() + " (" + llmClient.getProviderName() + ")");
+                                System.out.println("   上下文策略: " + reactAgent.getMemoryManager().getContextProfile().summary());
                                 System.out.println("   对话上下文已保留，使用 /clear 可清空\n");
                             }
                         }
@@ -328,8 +482,20 @@ public class Main {
                         printPolicyStatus(reactAgent);
                         continue;
                     }
+                    case CONFIG -> {
+                        handleConfigPalette(renderer, config, llmClient, hitlHandler, skillRegistry);
+                        continue;
+                    }
                     case AUDIT_TAIL -> {
                         printAuditTail(reactAgent, command.payload());
+                        continue;
+                    }
+                    case SNAPSHOT -> {
+                        printSnapshotCommand(reactAgent.getToolRegistry().getSnapshotService(), command.payload());
+                        continue;
+                    }
+                    case RESTORE_SNAPSHOT -> {
+                        printRestoreCommand(reactAgent.getToolRegistry().getSnapshotService(), command.payload());
                         continue;
                     }
                     case MCP_LIST -> {
@@ -359,6 +525,43 @@ public class Main {
                     }
                     case MCP_PROMPTS -> {
                         printMcpCommandResult(mcpServerManager.prompts(command.payload()));
+                        continue;
+                    }
+                    case BROWSER -> {
+                        printMcpCommandResult(handleBrowserCommand(
+                                command.payload(),
+                                browserSession,
+                                browserConnectivityCheck,
+                                mcpServerManager,
+                                hitlToolRegistry,
+                                hitlHandler));
+                        continue;
+                    }
+                    case TASK -> {
+                        printMcpCommandResult(TaskCommandFormatter.handle(taskManager, command.payload()));
+                        continue;
+                    }
+                    case SKILL_LIST -> {
+                        System.out.println(SkillCommandHandler.list(skillRegistry));
+                        continue;
+                    }
+                    case SKILL_SHOW -> {
+                        System.out.println(SkillCommandHandler.show(skillRegistry, command.payload()));
+                        continue;
+                    }
+                    case SKILL_ON -> {
+                        System.out.println(SkillCommandHandler.enable(skillRegistry, skillStateStore, command.payload()));
+                        continue;
+                    }
+                    case SKILL_OFF -> {
+                        System.out.println(SkillCommandHandler.disable(skillRegistry, skillStateStore, command.payload()));
+                        continue;
+                    }
+                    case SKILL_RELOAD -> {
+                        skillRegistry.reload();
+                        System.out.println("🔄 已重新扫描 skill 目录");
+                        System.out.println(SkillCommandHandler.startupSummary(skillRegistry));
+                        System.out.println("✅ 下一轮 LLM 调用生效");
                         continue;
                     }
                     case INDEX_CODE -> {
@@ -438,24 +641,36 @@ public class Main {
                 // 运行 Agent
                 input = mentionExpander.expand(input);
                 System.out.println();
+                renderer.beginTurn();
                 final String taskInput = input;
                 Callable<String> runTask;
+                String snapshotMode;
                 if (nextTaskUsePlanMode || command.type() == CliCommandParser.CommandType.SWITCH_PLAN) {
+                    snapshotMode = "plan";
                     LlmClient activeClient = llmClient;
                     runTask = () -> {
                         PlanExecuteAgent planAgent = createPlanAgent(activeClient, reactAgent, terminal, lineReader);
+                        planAgent.setExternalContextSupplier(mcpServerManager::resourceIndexForPrompt);
+                        planAgent.setSkillRegistry(skillRegistry);
+                        planAgent.setSkillContextBuffer(skillContextBuffer);
                         return planAgent.run(taskInput);
                     };
                 } else if (nextTaskUseTeamMode || command.type() == CliCommandParser.CommandType.SWITCH_TEAM) {
+                    snapshotMode = "team";
                     LlmClient activeClient = llmClient;
                     runTask = () -> {
                         AgentOrchestrator orchestrator = createTeamAgent(activeClient, reactAgent);
+                        orchestrator.setExternalContextSupplier(mcpServerManager::resourceIndexForPrompt);
+                        orchestrator.setSkillSystem(skillRegistry, skillContextBuffer);
                         return orchestrator.run(taskInput);
                     };
                 } else {
+                    snapshotMode = "react";
                     runTask = () -> reactAgent.run(taskInput);
                 }
-                String response = runWithCancelSupport(terminal, runTask);
+                SnapshotService snapshotService = reactAgent.getToolRegistry().getSnapshotService();
+                String response = runWithCancelSupport(terminal,
+                        () -> snapshotService.runTurn(snapshotMode, taskInput, runTask::call));
                 nextTaskUsePlanMode = false;
                 nextTaskUseTeamMode = false;
                 if (response != null && !response.isBlank()) {
@@ -470,6 +685,75 @@ public class Main {
         }
 
         System.out.println("\n👋 再见!");
+    }
+
+    private static boolean isRuntimeServeCommand(String[] args) {
+        return args != null
+                && args.length >= 1
+                && "serve".equalsIgnoreCase(args[0])
+                && java.util.Arrays.stream(args).anyMatch("--http"::equalsIgnoreCase);
+    }
+
+    private static void startRuntimeApiAndBlock(String[] args) {
+        PaiCliConfig config = PaiCliConfig.load();
+        LlmClient client = LlmClientFactory.createFromConfig(config);
+        if (client == null) {
+            System.err.println("❌ 错误: 未找到可用的 API Key");
+            System.exit(1);
+        }
+        int port = parseServePort(args, 8080);
+        try {
+            RuntimeThreadStore store = new RuntimeThreadStore(RuntimeThreadStore.defaultDbPath());
+            RuntimeApiServer server = new RuntimeApiServer(
+                    store,
+                    prompt -> runHeadlessTask(prompt, client),
+                    port,
+                    RuntimeApiServer.configuredApiKey());
+            Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                server.close();
+                store.close();
+            }, "paicli-runtime-api-shutdown"));
+            server.start();
+            System.out.println("✅ PaiCLI Runtime API 已启动: http://127.0.0.1:" + server.port());
+            System.out.println("   认证: Authorization: Bearer <PAICLI_RUNTIME_API_KEY>");
+            new CountDownLatch(1).await();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } catch (Exception e) {
+            System.err.println("❌ Runtime API 启动失败: " + e.getMessage());
+            System.exit(1);
+        }
+    }
+
+    private static int parseServePort(String[] args, int defaultPort) {
+        if (args == null) {
+            return defaultPort;
+        }
+        for (int i = 0; i < args.length - 1; i++) {
+            if ("--port".equalsIgnoreCase(args[i])) {
+                try {
+                    return Integer.parseInt(args[i + 1]);
+                } catch (NumberFormatException ignored) {
+                    return defaultPort;
+                }
+            }
+        }
+        return defaultPort;
+    }
+
+    private static String runHeadlessTask(String prompt, LlmClient llmClient) {
+        ToolRegistry registry = new ToolRegistry();
+        registry.setProjectPath(Path.of(".").toAbsolutePath().normalize().toString());
+        Agent agent = new Agent(llmClient, registry);
+        return agent.run(prompt);
+    }
+
+    private static DurableTaskManager openTaskManager(AtomicReference<LlmClient> llmClientRef) {
+        try {
+            return DurableTaskManager.openDefault(prompt -> runHeadlessTask(prompt, llmClientRef.get()));
+        } catch (Exception e) {
+            throw new IllegalStateException("后台任务管理器初始化失败: " + e.getMessage(), e);
+        }
     }
 
     static PlanExecuteAgent createPlanAgent(LlmClient llmClient, Agent reactAgent,
@@ -601,8 +885,14 @@ public class Main {
         return classifyEscapeSequence(escTail) == EscapeSequenceType.STANDALONE_ESC;
     }
 
-    private static PromptInput readPromptInput(Terminal terminal, LineReader lineReader, boolean allowEscCancel)
+    private static PromptInput readPromptInput(Terminal terminal,
+                                               LineReader lineReader,
+                                               boolean allowEscCancel,
+                                               boolean spaciousPrompt)
             throws UserInterruptException, EndOfFileException {
+        if (spaciousPrompt) {
+            System.out.println();
+        }
         if (!allowEscCancel) {
             return PromptInput.submitted(lineReader.readLine("👤 你: "));
         }
@@ -627,6 +917,21 @@ public class Main {
         }
 
         return PromptInput.submitted(lineReader.readLine("", null, (MaskingCallback) null, prefill.seedBuffer()));
+    }
+
+    static boolean defaultSpaciousPrompt(boolean statusBarAvailable) {
+        return false;
+    }
+
+    static void configureAwtForCli() {
+        if (!isMacOs()) {
+            return;
+        }
+        System.setProperty("java.awt.headless", "true");
+    }
+
+    static boolean isMacOs() {
+        return System.getProperty("os.name", "").toLowerCase(Locale.ROOT).contains("mac");
     }
 
     private static PlanExecuteAgent.PlanReviewHandler createPlanReviewHandler(Terminal terminal, LineReader lineReader) {
@@ -824,31 +1129,252 @@ public class Main {
     static List<String> startupHints() {
         return List.of(
                 "输入你的问题或任务",
-                "输入 '/model' 查看当前模型，'/model glm' 或 '/model deepseek' 切换模型",
-                "输入 '/plan' 后，下一条任务使用 Plan-and-Execute 模式",
-                "输入 '/plan 任务内容' 直接用计划模式执行这条任务",
-                "输入 '/team' 后，下一条任务使用 Multi-Agent 协作模式",
-                "输入 '/team 任务内容' 直接用多 Agent 协作执行这条任务",
-                "计划生成后可直接执行、补充要求重规划，或取消",
+                "输入 '/' 查看命令",
+                "输入 '@server:protocol://path' 可显式引用 MCP resource",
                 "任务运行中按 ESC 取消当前任务",
-                "输入 '/hitl on' 启用危险操作人工审批（HITL）",
-                "输入 '/hitl off' 关闭 HITL 审批",
-                "输入 '/mcp' 查看 MCP server，'/mcp restart|logs|disable|enable <name>' 管理 MCP",
-                "输入 '/mcp resources <name>' 查看 MCP resources，'/mcp prompts <name>' 查看 prompts",
-                "在普通任务里输入 '@server:protocol://path' 可显式引用 MCP resource",
-                "输入 '/policy' 查看安全策略状态（路径围栏 / 命令黑名单 / 资源上限）",
-                "输入 '/audit [N]' 查看最近 N 条危险工具审计记录（默认 10）",
-                "输入 '/index [路径]' 为代码库建立向量索引",
-                "输入 '/search <查询>' 语义检索代码",
-                "输入 '/graph <类名>' 查看代码关系图谱",
-                "默认模式是 ReAct",
-                "输入 '/clear' 清空对话历史",
-                "输入 '/context' 查看上下文和记忆状态",
-                "输入 '/memory' 查看记忆状态",
-                "输入 '/memory clear' 清空长期记忆",
-                "输入 '/save 事实内容' 手动保存关键事实",
-                "输入 '/exit' 或 '/quit' 退出"
+                "默认模式是 ReAct"
         );
+    }
+
+    record SlashCommandHint(String insertText, String display, String description) {
+    }
+
+    static List<SlashCommandHint> slashCommandHints() {
+        return List.of(
+                new SlashCommandHint("/model", "/model", "查看当前模型"),
+                new SlashCommandHint("/model glm-5.1", "/model glm-5.1", "切换到 GLM-5.1"),
+                new SlashCommandHint("/model glm-5v-turbo", "/model glm-5v-turbo", "切换到 GLM-5V-Turbo 多模态"),
+                new SlashCommandHint("/model deepseek", "/model deepseek", "切换到 DeepSeek（读取配置模型）"),
+                new SlashCommandHint("/model step", "/model step", "切换到 StepFun（读取配置模型）"),
+                new SlashCommandHint("/model kimi", "/model kimi", "切换到 Kimi（读取配置模型）"),
+                new SlashCommandHint("/plan", "/plan", "下一条任务使用 Plan-and-Execute 模式"),
+                new SlashCommandHint("/plan ", "/plan <任务内容>", "直接用计划模式执行这条任务"),
+                new SlashCommandHint("/team", "/team", "下一条任务使用 Multi-Agent 协作模式"),
+                new SlashCommandHint("/team ", "/team <任务内容>", "直接用多 Agent 协作执行这条任务"),
+                new SlashCommandHint("/hitl", "/hitl", "查看 HITL 状态"),
+                new SlashCommandHint("/hitl on", "/hitl on", "启用危险操作人工审批"),
+                new SlashCommandHint("/hitl off", "/hitl off", "关闭 HITL 审批"),
+                new SlashCommandHint("/browser", "/browser", "查看浏览器会话状态"),
+                new SlashCommandHint("/browser connect", "/browser connect", "复用已允许远程调试的登录态 Chrome"),
+                new SlashCommandHint("/browser connect ", "/browser connect <port>", "旧式 CDP 端口连接"),
+                new SlashCommandHint("/browser status", "/browser status", "查看浏览器会话状态"),
+                new SlashCommandHint("/browser tabs", "/browser tabs", "查看 shared 模式真实 Chrome tab"),
+                new SlashCommandHint("/browser disconnect", "/browser disconnect", "切回 isolated 浏览器模式"),
+                new SlashCommandHint("/task", "/task", "查看后台任务列表"),
+                new SlashCommandHint("/task add ", "/task add <任务内容>", "提交后台任务"),
+                new SlashCommandHint("/task cancel ", "/task cancel <task_id>", "取消后台任务"),
+                new SlashCommandHint("/task log ", "/task log <task_id>", "查看后台任务结果"),
+                new SlashCommandHint("/mcp", "/mcp", "查看 MCP server 状态"),
+                new SlashCommandHint("/mcp restart ", "/mcp restart <name>", "重启 MCP server"),
+                new SlashCommandHint("/mcp logs ", "/mcp logs <name>", "查看 MCP server 日志"),
+                new SlashCommandHint("/mcp disable ", "/mcp disable <name>", "禁用 MCP server"),
+                new SlashCommandHint("/mcp enable ", "/mcp enable <name>", "启用 MCP server"),
+                new SlashCommandHint("/mcp resources ", "/mcp resources <name>", "查看 MCP resources"),
+                new SlashCommandHint("/mcp prompts ", "/mcp prompts <name>", "查看 MCP prompts"),
+                new SlashCommandHint("/policy", "/policy", "查看安全策略状态"),
+                new SlashCommandHint("/config", "/config", "打开配置 palette（只读视图 + 切换提示）"),
+                new SlashCommandHint("/audit", "/audit", "查看今日最近 10 条危险工具审计"),
+                new SlashCommandHint("/audit ", "/audit [N]", "查看今日最近 N 条危险工具审计"),
+                new SlashCommandHint("/snapshot", "/snapshot", "查看最近 Side-Git 快照"),
+                new SlashCommandHint("/snapshot status", "/snapshot status", "查看 Side-Git 快照状态"),
+                new SlashCommandHint("/snapshot clean", "/snapshot clean", "清理当前项目 Side-Git 快照"),
+                new SlashCommandHint("/restore ", "/restore <N>", "恢复到最近第 N 个 pre-turn 快照"),
+                new SlashCommandHint("/index", "/index", "索引当前代码库"),
+                new SlashCommandHint("/index ", "/index [路径]", "索引指定路径代码库"),
+                new SlashCommandHint("/search ", "/search <查询>", "语义检索代码"),
+                new SlashCommandHint("/graph ", "/graph <类名>", "查看代码关系图谱"),
+                new SlashCommandHint("/clear", "/clear", "清空当前对话历史"),
+                new SlashCommandHint("/context", "/context", "查看上下文和记忆状态"),
+                new SlashCommandHint("/memory", "/memory", "查看记忆状态"),
+                new SlashCommandHint("/memory clear", "/memory clear", "清空长期记忆"),
+                new SlashCommandHint("/save ", "/save <事实内容>", "手动保存关键事实到长期记忆"),
+                new SlashCommandHint("/skill", "/skill", "查看 skill 列表"),
+                new SlashCommandHint("/skill list", "/skill list", "查看 skill 列表"),
+                new SlashCommandHint("/skill show ", "/skill show <name>", "查看 SKILL.md 全文"),
+                new SlashCommandHint("/skill on ", "/skill on <name>", "启用 skill"),
+                new SlashCommandHint("/skill off ", "/skill off <name>", "禁用 skill"),
+                new SlashCommandHint("/skill reload", "/skill reload", "重新扫描 skill 目录"),
+                new SlashCommandHint("/exit", "/exit", "退出 PaiCLI"),
+                new SlashCommandHint("/quit", "/quit", "退出 PaiCLI")
+        );
+    }
+
+    private static void printSlashCommandHelp() {
+        System.out.println("可用命令：");
+        for (SlashCommandHint hint : slashCommandHints()) {
+            System.out.println("   " + hint.display() + " - " + hint.description());
+        }
+        System.out.println();
+    }
+
+    static void configureSlashCommandHint(LineReader lineReader) {
+        if (lineReader == null) {
+            return;
+        }
+        lineReader.getWidgets().put("paicli-slash-command-hint", () -> {
+            boolean atPromptStart = lineReader.getBuffer().length() == 0;
+            lineReader.getBuffer().write("/");
+            if (atPromptStart) {
+                int width = 100;
+                if (lineReader.getTerminal() != null && lineReader.getTerminal().getSize() != null) {
+                    width = Math.max(40, lineReader.getTerminal().getSize().getColumns());
+                }
+                lineReader.printAbove(formatSlashCommandChoices(width));
+                lineReader.callWidget(LineReader.REDISPLAY);
+            }
+            return true;
+        });
+        Reference slashHint = new Reference("paicli-slash-command-hint");
+        bindSlashWidget(lineReader, LineReader.MAIN, slashHint);
+        bindSlashWidget(lineReader, LineReader.EMACS, slashHint);
+        bindSlashWidget(lineReader, LineReader.VIINS, slashHint);
+    }
+
+    private static void bindSlashWidget(LineReader lineReader, String keyMapName, Reference slashHint) {
+        KeyMap<org.jline.reader.Binding> keyMap = lineReader.getKeyMaps().get(keyMapName);
+        if (keyMap != null) {
+            keyMap.bind(slashHint, "/");
+        }
+    }
+
+    static String formatSlashCommandChoices(int terminalWidth) {
+        List<String> commands = slashCommandHints().stream()
+                .map(SlashCommandHint::display)
+                .distinct()
+                .toList();
+        int maxLen = commands.stream().mapToInt(String::length).max().orElse(12);
+        int colWidth = Math.min(Math.max(maxLen + 4, 18), Math.max(18, terminalWidth));
+        int columns = Math.max(1, Math.min(4, terminalWidth / colWidth));
+        int rows = (int) Math.ceil(commands.size() / (double) columns);
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("可用命令（Tab 补全，Enter 执行）：\n");
+        for (int row = 0; row < rows; row++) {
+            for (int col = 0; col < columns; col++) {
+                int index = col * rows + row;
+                if (index >= commands.size()) {
+                    continue;
+                }
+                String command = commands.get(index);
+                sb.append(command);
+                if (col < columns - 1) {
+                    sb.append(" ".repeat(Math.max(2, colWidth - command.length())));
+                }
+            }
+            sb.append('\n');
+        }
+        return sb.toString();
+    }
+
+    /**
+     * /config 命令处理：用 renderer.openPalette 展示当前配置项列表。
+     * 当前是只读视图——选中一项后提示对应的 CLI 命令，由用户自己执行。
+     */
+    private static void handleConfigPalette(Renderer renderer,
+                                            PaiCliConfig config,
+                                            LlmClient llmClient,
+                                            SwitchableHitlHandler hitlHandler,
+                                            com.paicli.skill.SkillRegistry skillRegistry) {
+        var items = java.util.List.of(
+                "模型: " + (llmClient == null ? "(none)" : llmClient.getModelName() + " / " + llmClient.getProviderName()),
+                "默认 Provider: " + (config == null ? "(none)" : config.getDefaultProvider()),
+                "HITL: " + (hitlHandler.isEnabled() ? "ON" : "OFF"),
+                "Skill 启用数: " + (skillRegistry == null ? 0 : skillRegistry.enabledSkills().size()),
+                "渲染器: " + renderer.getClass().getSimpleName(),
+                "配置文件: ~/.paicli/config.json (只读视图，编辑请用编辑器)"
+        );
+        int selected = renderer.openPalette("配置 / config", items);
+        if (selected < 0) {
+            System.out.println("(已关闭)");
+            return;
+        }
+        String hint = switch (selected) {
+            case 0, 1 -> "💡 GLM: /model glm-5.1 / /model glm-5v-turbo；其它: /model deepseek|step|kimi 读取配置模型";
+            case 2 -> "💡 切换 HITL: /hitl on / /hitl off";
+            case 3 -> "💡 管理 Skill: /skill list / /skill on <name> / /skill off <name>";
+            case 4 -> "💡 切换渲染器（重启后生效）: PAICLI_RENDERER=inline|lanterna|plain";
+            case 5 -> "💡 当前不在 TUI 内编辑 config.json，建议在编辑器里改完重启";
+            default -> "(unknown)";
+        };
+        System.out.println(hint);
+    }
+
+    static void bindCtrlOToFoldableBlocks(LineReader lineReader, InlineRenderer inline) {
+        if (lineReader == null || inline == null) {
+            return;
+        }
+        lineReader.getWidgets().put("paicli-toggle-foldable", () -> {
+            inline.toggleLastBlock();
+            lineReader.callWidget(LineReader.REDISPLAY);
+            return true;
+        });
+        Reference ref = new Reference("paicli-toggle-foldable");
+        String ctrlO = String.valueOf((char) 15);  // Ctrl+O
+        for (String mapName : new String[]{LineReader.MAIN, LineReader.EMACS, LineReader.VIINS}) {
+            KeyMap<org.jline.reader.Binding> map = lineReader.getKeyMaps().get(mapName);
+            if (map != null) {
+                map.bind(ref, ctrlO);
+            }
+        }
+    }
+
+    // Ctrl+V 抓系统剪贴板里的图片到 ~/.paicli/cache/ 并把 @image:<path> 注入当前输入行。
+    // 失败（无图 / headless / IO 错误）时只打提示，不破坏现有 buffer，覆盖掉 JLine 默认的
+    // quoted-insert 没有交互价值。注意 macOS Cmd+V 通常被终端劫持成本地粘贴文本，所以这里
+    // 绑的是 Ctrl+V（ASCII 22 / SYN），iTerm / Terminal.app 默认不会拦截。
+    //
+    // 输入层不按模型名拦截图片：与 Claude Code 类似，先把图片读成附件收进
+    // prompt；模型是否接受 image block 由 provider API 自己处理。
+    static void bindCtrlVToClipboardImage(LineReader lineReader) {
+        if (lineReader == null) {
+            return;
+        }
+        lineReader.getWidgets().put("paicli-paste-clipboard-image", () -> {
+            ClipboardImage.GrabResult grab = ClipboardImage.grab();
+            if (!grab.ok()) {
+                lineReader.printAbove("⚠️ Ctrl+V 抓图失败: " + grab.error());
+                lineReader.callWidget(LineReader.REDISPLAY);
+                return true;
+            }
+            String token = "@image:<" + grab.path().toAbsolutePath() + "> ";
+            lineReader.getBuffer().write(token);
+            lineReader.callWidget(LineReader.REDISPLAY);
+            return true;
+        });
+        Reference ref = new Reference("paicli-paste-clipboard-image");
+        String ctrlV = String.valueOf((char) 22);  // Ctrl+V (SYN)
+        for (String mapName : new String[]{LineReader.MAIN, LineReader.EMACS, LineReader.VIINS}) {
+            KeyMap<org.jline.reader.Binding> map = lineReader.getKeyMaps().get(mapName);
+            if (map != null) {
+                map.bind(ref, ctrlV);
+            }
+        }
+    }
+
+    static void bindEscToClearInput(LineReader lineReader) {
+        if (lineReader == null) {
+            return;
+        }
+        lineReader.getWidgets().put("paicli-clear-input", () -> {
+            clearInputBuffer(lineReader);
+            lineReader.callWidget(LineReader.REDISPLAY);
+            return true;
+        });
+        Reference clearInput = new Reference("paicli-clear-input");
+        String esc = KeyMap.esc();
+        for (String mapName : new String[]{LineReader.MAIN, LineReader.EMACS, LineReader.VIINS}) {
+            KeyMap<org.jline.reader.Binding> map = lineReader.getKeyMaps().get(mapName);
+            if (map != null) {
+                map.bind(clearInput, esc);
+            }
+        }
+    }
+
+    static void clearInputBuffer(LineReader lineReader) {
+        if (lineReader == null || lineReader.getBuffer() == null) {
+            return;
+        }
+        lineReader.getBuffer().clear();
     }
 
     private static void printPolicyStatus(Agent reactAgent) {
@@ -861,6 +1387,155 @@ public class Main {
         System.out.println("   命令执行上限: 60 秒，输出 8KB（截断）");
         System.out.println("   审计目录: " + reactAgent.getToolRegistry().getAuditLog().getAuditDir());
         System.out.println();
+    }
+
+    static String handleBrowserCommand(String payload,
+                                       BrowserSession browserSession,
+                                       BrowserConnectivityCheck connectivityCheck,
+                                       McpServerManager mcpServerManager,
+                                       HitlToolRegistry registry,
+                                       HitlHandler hitlHandler) {
+        String normalized = payload == null || payload.isBlank() ? "status" : payload.trim();
+        String[] parts = normalized.split("\\s+");
+        String subCommand = parts[0].toLowerCase();
+        return switch (subCommand) {
+            case "status" -> browserStatus(browserSession, connectivityCheck, mcpServerManager);
+            case "connect" -> {
+                if (parts.length >= 2) {
+                    int port = parseBrowserPort(parts[1]);
+                    yield browserConnectByPort(port, browserSession, connectivityCheck, mcpServerManager, hitlHandler);
+                }
+                yield browserAutoConnect(browserSession, mcpServerManager, hitlHandler);
+            }
+            case "disconnect" -> browserDisconnect(browserSession, mcpServerManager, hitlHandler);
+            case "tabs" -> browserTabs(browserSession, registry);
+            default -> """
+                    ❌ 未知 /browser 子命令: %s
+                    可用命令：
+                      /browser status
+                      /browser connect [port]
+                      /browser disconnect
+                      /browser tabs
+                    """.formatted(normalized).trim();
+        };
+    }
+
+    private static String browserStatus(BrowserSession browserSession,
+                                        BrowserConnectivityCheck connectivityCheck,
+                                        McpServerManager mcpServerManager) {
+        BrowserConnectivityCheck.ProbeResult probe = connectivityCheck.probe(9222);
+        McpServer server = mcpServerManager.server("chrome-devtools");
+        String serverStatus = server == null
+                ? "未配置"
+                : server.status() == McpServerStatus.READY
+                ? "● ready (" + server.tools().size() + " tools)"
+                : server.status().name().toLowerCase() + (server.errorMessage() == null ? "" : " - " + server.errorMessage());
+        String mode = browserSession.mode() == BrowserMode.SHARED
+                ? "shared（复用 " + browserSession.browserUrl() + "）"
+                : "isolated（临时 user-data-dir，无登录态）";
+        return """
+                🌐 浏览器会话
+                  当前模式: %s
+                  chrome-devtools server: %s
+                  旧式 /json/version 探活: %s
+                  自动连接: Chrome 144+ 可在 chrome://inspect/#remote-debugging 勾选 Allow remote debugging 后使用 /browser connect
+                """.formatted(mode, serverStatus, probe.ok() ? "✅ " + probe.browserUrl() : "⚠️ " + probe.message()).trim();
+    }
+
+    private static String browserAutoConnect(BrowserSession browserSession,
+                                             McpServerManager mcpServerManager,
+                                             HitlHandler hitlHandler) {
+        McpServer server = mcpServerManager.server("chrome-devtools");
+        if (server == null) {
+            return "❌ 未配置 chrome-devtools MCP server，请先检查 ~/.paicli/mcp.json";
+        }
+        List<String> oldArgs = List.copyOf(server.config().getArgs());
+        List<String> autoConnectArgs = List.of("-y", "chrome-devtools-mcp@latest", "--autoConnect");
+        String result = mcpServerManager.restartWithArgs("chrome-devtools", autoConnectArgs);
+        McpServer restarted = mcpServerManager.server("chrome-devtools");
+        if (restarted != null && restarted.status() == McpServerStatus.READY) {
+            browserSession.switchToShared("autoConnect");
+            hitlHandler.clearApprovedAllForServer("chrome-devtools");
+            return "🔄 已用 --autoConnect 连接 Chrome（需已在 chrome://inspect/#remote-debugging 允许远程调试）\n" + result;
+        }
+        mcpServerManager.restartWithArgs("chrome-devtools", oldArgs);
+        return "❌ autoConnect 连接失败，已回滚 chrome-devtools 启动参数：\n" + result
+                + "\n\n请确认 Chrome 144+ 已打开 chrome://inspect/#remote-debugging，并勾选 Allow remote debugging for this browser instance。";
+    }
+
+    private static String browserConnectByPort(int port,
+                                               BrowserSession browserSession,
+                                               BrowserConnectivityCheck connectivityCheck,
+                                               McpServerManager mcpServerManager,
+                                               HitlHandler hitlHandler) {
+        if (port < 1024 || port > 65535) {
+            return "❌ /browser connect 端口必须在 1024-65535 之间。默认 /browser connect 使用 --autoConnect；旧式 CDP 端口连接可用 /browser connect 9222。";
+        }
+        BrowserConnectivityCheck.ProbeResult probe = connectivityCheck.probe(port);
+        if (!probe.ok()) {
+            return "❌ 未检测到 Chrome 调试端口 127.0.0.1:" + port + "：" + probe.message() + "\n\n"
+                    + chromeLaunchHelp(port);
+        }
+
+        McpServer server = mcpServerManager.server("chrome-devtools");
+        if (server == null) {
+            return "❌ 未配置 chrome-devtools MCP server，请先检查 ~/.paicli/mcp.json";
+        }
+        List<String> oldArgs = List.copyOf(server.config().getArgs());
+        List<String> sharedArgs = List.of("-y", "chrome-devtools-mcp@latest", "--browser-url=" + probe.browserUrl());
+        String result = mcpServerManager.restartWithArgs("chrome-devtools", sharedArgs);
+        McpServer restarted = mcpServerManager.server("chrome-devtools");
+        if (restarted != null && restarted.status() == McpServerStatus.READY) {
+            browserSession.switchToShared(probe.browserUrl());
+            hitlHandler.clearApprovedAllForServer("chrome-devtools");
+            return "🔄 切换 chrome-devtools server 到 shared 模式 (" + probe.browserUrl() + ")\n" + result;
+        }
+        mcpServerManager.restartWithArgs("chrome-devtools", oldArgs);
+        return "❌ shared 模式切换失败，已回滚 chrome-devtools 启动参数：\n" + result;
+    }
+
+    private static String browserDisconnect(BrowserSession browserSession,
+                                            McpServerManager mcpServerManager,
+                                            HitlHandler hitlHandler) {
+        McpServer server = mcpServerManager.server("chrome-devtools");
+        if (server == null) {
+            browserSession.switchToIsolated();
+            return "❌ 未配置 chrome-devtools MCP server，已清理本地浏览器会话状态";
+        }
+        String result = mcpServerManager.restartWithArgs(
+                "chrome-devtools",
+                List.of("-y", "chrome-devtools-mcp@latest", "--isolated=true"));
+        browserSession.switchToIsolated();
+        hitlHandler.clearApprovedAllForServer("chrome-devtools");
+        return "🔄 已切回 isolated 浏览器模式\n" + result;
+    }
+
+    private static String browserTabs(BrowserSession browserSession, HitlToolRegistry registry) {
+        if (browserSession.mode() != BrowserMode.SHARED) {
+            return "当前为 isolated 模式，没有真实 Chrome tab 可复用。可用 /browser connect 切到 shared 模式。";
+        }
+        return registry.executeTool("mcp__chrome-devtools__list_pages", "{}");
+    }
+
+    private static int parseBrowserPort(String value) {
+        if (value == null || value.isBlank()) {
+            return 9222;
+        }
+        try {
+            return Integer.parseInt(value.trim());
+        } catch (NumberFormatException e) {
+            return -1;
+        }
+    }
+
+    private static String chromeLaunchHelp(int port) {
+        return """
+                请先用调试端口启动 Chrome：
+                  macOS: open -na "Google Chrome" --args --remote-debugging-port=%d --user-data-dir=/tmp/paicli-chrome-profile
+                  Windows: start chrome.exe --remote-debugging-port=%d --user-data-dir=%%TEMP%%\\paicli-chrome-profile
+                  Linux: google-chrome --remote-debugging-port=%d --user-data-dir=/tmp/paicli-chrome-profile
+                然后重新执行 /browser connect %d
+                """.formatted(port, port, port, port).trim();
     }
 
     private static void printMcpCommandResult(String result) {
@@ -886,8 +1561,76 @@ public class Main {
             if (entry.reason() != null && !entry.reason().isBlank()) {
                 System.out.println("        原因: " + entry.reason());
             }
+            BrowserAuditMetadata metadata = entry.metadata();
+            if (metadata != null) {
+                System.out.println("        浏览器: mode=" + metadata.browserMode()
+                        + ", sensitive=" + metadata.sensitive()
+                        + (metadata.targetUrl() == null ? "" : ", url=" + metadata.targetUrl()));
+            }
         }
         System.out.println();
+    }
+
+    private static void printSnapshotCommand(SnapshotService snapshotService, String payload) {
+        String normalized = payload == null || payload.isBlank() ? "list" : payload.trim().toLowerCase();
+        if ("status".equals(normalized)) {
+            System.out.println(snapshotService.status());
+            System.out.println();
+            return;
+        }
+        if ("clean".equals(normalized)) {
+            System.out.println(snapshotService.clean());
+            System.out.println();
+            return;
+        }
+        if (!"list".equals(normalized)) {
+            System.out.println("""
+                    ❌ 未知 /snapshot 子命令: %s
+                    可用命令：
+                      /snapshot
+                      /snapshot status
+                      /snapshot clean
+                      /restore <N>
+                    """.formatted(payload).trim());
+            System.out.println();
+            return;
+        }
+        try {
+            List<TurnSnapshot> snapshots = snapshotService.listSnapshots(20);
+            if (snapshots.isEmpty()) {
+                System.out.println("📭 暂无 Side-Git 快照\n");
+                return;
+            }
+            System.out.println("📸 最近 " + snapshots.size() + " 条 Side-Git 快照：");
+            int preTurnIndex = 0;
+            for (TurnSnapshot snapshot : snapshots) {
+                String restoreHint = "";
+                if ("pre-turn".equals(snapshot.phase().label())) {
+                    preTurnIndex++;
+                    restoreHint = "  /restore " + preTurnIndex;
+                }
+                System.out.printf("   %s %-11s %-18s %s%s%n",
+                        snapshot.shortCommitId(),
+                        snapshot.phase().label(),
+                        snapshot.turnId(),
+                        snapshot.createdAt(),
+                        restoreHint);
+            }
+            System.out.println();
+        } catch (Exception e) {
+            System.out.println("❌ 读取快照失败: " + e.getMessage() + "\n");
+        }
+    }
+
+    private static void printRestoreCommand(SnapshotService snapshotService, String payload) {
+        int offset = parseAuditCount(payload, 1);
+        try {
+            RestoreResult result = snapshotService.restorePreTurn(offset);
+            System.out.println(result.formatForCli());
+            System.out.println();
+        } catch (Exception e) {
+            System.out.println("❌ 恢复快照失败: " + e.getMessage() + "\n");
+        }
     }
 
     private static int parseAuditCount(String payload, int defaultN) {
@@ -1081,6 +1824,39 @@ public class Main {
         return null;
     }
 
+    static ModelSelection resolveModelSelection(String raw) {
+        String value = raw == null ? "" : raw.trim();
+        String normalized = value.toLowerCase(Locale.ROOT);
+        return switch (normalized) {
+            case "glm" -> new ModelSelection("glm", "glm-5.1", true);
+            case "deepseek" -> new ModelSelection("deepseek", null, false);
+            case "step", "stepfun", "step-fun" -> new ModelSelection("step", null, false);
+            case "kimi", "moonshot", "moonshotai", "moonshot-ai" -> new ModelSelection("kimi", null, false);
+            default -> {
+                if (normalized.startsWith("glm-")) {
+                    yield new ModelSelection("glm", value, true);
+                }
+                if (normalized.startsWith("deepseek")) {
+                    yield new ModelSelection("deepseek", value, true);
+                }
+                if (normalized.startsWith("step")) {
+                    yield new ModelSelection("step", value, true);
+                }
+                if (normalized.startsWith("kimi-") || normalized.startsWith("moonshot-")) {
+                    yield new ModelSelection("kimi", value, true);
+                }
+                yield new ModelSelection(normalized, null, false);
+            }
+        };
+    }
+
+    private static PaiCliConfig.ProviderConfig ensureProviderConfig(PaiCliConfig config, String provider) {
+        if (config.getProviders() == null) {
+            config.setProviders(new LinkedHashMap<>());
+        }
+        return config.getProviders().computeIfAbsent(provider, ignored -> new PaiCliConfig.ProviderConfig());
+    }
+
     private static void printBanner() {
         System.out.println("╔══════════════════════════════════════════════════════════╗");
         System.out.println("║                                                          ║");
@@ -1091,7 +1867,7 @@ public class Main {
         System.out.println("║   ██║  ██║██║  ██║╚██████╗███████╗██║                  ║");
         System.out.println("║   ╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝╚══════╝╚═╝                  ║");
         System.out.println("║                                                          ║");
-        System.out.printf("║      MCP-Native Agent CLI %-29s║%n", "v" + VERSION);
+        System.out.printf("║      Terminal-First Agent IDE %-23s║%n", "v" + VERSION);
         System.out.println("║                                                          ║");
         System.out.println("╚══════════════════════════════════════════════════════════╝");
         System.out.println();
@@ -1125,5 +1901,28 @@ public class Main {
             System.err.println("❌ eval 模式执行失败: " + e.getMessage());
             e.printStackTrace(System.err);
         }
+    }
+
+    static McpConfigBootstrapResult ensureDefaultMcpConfig(Path userHome) throws IOException {
+        Path configFile = userHome.resolve(".paicli").resolve("mcp.json");
+        if (Files.notExists(configFile)) {
+            Files.createDirectories(configFile.getParent());
+            Files.writeString(configFile, DEFAULT_CHROME_DEVTOOLS_MCP_JSON);
+            return new McpConfigBootstrapResult(true,
+                    "✅ 已创建默认 MCP 配置: " + configFile
+                            + "\n   默认启用 chrome-devtools（isolated 模式）。");
+        }
+        String content = Files.readString(configFile);
+        if (!content.contains("\"chrome-devtools\"")) {
+            return new McpConfigBootstrapResult(false,
+                    "ℹ️ 检测到 ~/.paicli/mcp.json 未配置 chrome-devtools，建议参考 README 添加浏览器 MCP server。");
+        }
+        return new McpConfigBootstrapResult(false, "");
+    }
+
+    record McpConfigBootstrapResult(boolean created, String message) {
+    }
+
+    record ModelSelection(String provider, String model, boolean explicitModel) {
     }
 }

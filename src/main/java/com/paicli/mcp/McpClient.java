@@ -14,6 +14,7 @@ import com.paicli.mcp.protocol.McpToolDescriptor;
 import com.paicli.mcp.resources.McpResourceContent;
 import com.paicli.mcp.resources.McpResourceDescriptor;
 import com.paicli.mcp.transport.McpTransport;
+import com.paicli.tool.ToolOutput;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -22,6 +23,9 @@ import java.util.function.Consumer;
 
 public class McpClient implements AutoCloseable {
     private static final ObjectMapper MAPPER = new ObjectMapper();
+    private static final int DEFAULT_INITIALIZE_TIMEOUT_SECONDS = 60;
+    private static final String INITIALIZE_TIMEOUT_PROPERTY = "paicli.mcp.initialize.timeout.seconds";
+    private static final String INITIALIZE_TIMEOUT_ENV = "PAICLI_MCP_INITIALIZE_TIMEOUT_SECONDS";
 
     private final String serverName;
     private final JsonRpcClient rpc;
@@ -35,9 +39,25 @@ public class McpClient implements AutoCloseable {
     }
 
     public void initialize() throws IOException {
-        JsonNode result = rpc.request("initialize", McpInitializeRequest.toJson(), 30);
+        JsonNode result = rpc.request("initialize", McpInitializeRequest.toJson(), initializeTimeoutSeconds());
         serverCapabilities = result == null ? JsonNodeFactory.instance.objectNode() : result.path("capabilities");
         rpc.sendNotification("notifications/initialized", JsonNodeFactory.instance.objectNode());
+    }
+
+    static int initializeTimeoutSeconds() {
+        String configured = System.getProperty(INITIALIZE_TIMEOUT_PROPERTY);
+        if (configured == null || configured.isBlank()) {
+            configured = System.getenv(INITIALIZE_TIMEOUT_ENV);
+        }
+        if (configured == null || configured.isBlank()) {
+            return DEFAULT_INITIALIZE_TIMEOUT_SECONDS;
+        }
+        try {
+            int seconds = Integer.parseInt(configured.trim());
+            return seconds > 0 ? seconds : DEFAULT_INITIALIZE_TIMEOUT_SECONDS;
+        } catch (NumberFormatException ignored) {
+            return DEFAULT_INITIALIZE_TIMEOUT_SECONDS;
+        }
     }
 
     public boolean supportsResources() {
@@ -74,6 +94,10 @@ public class McpClient implements AutoCloseable {
     }
 
     public String callTool(String toolName, String argumentsJson) throws IOException {
+        return callToolOutput(toolName, argumentsJson).text();
+    }
+
+    public ToolOutput callToolOutput(String toolName, String argumentsJson) throws IOException {
         JsonNode args;
         if (argumentsJson == null || argumentsJson.isBlank()) {
             args = JsonNodeFactory.instance.objectNode();
@@ -83,11 +107,11 @@ public class McpClient implements AutoCloseable {
         ObjectNode params = McpCallToolRequest.toJson(toolName, args);
         JsonNode result = rpc.request("tools/call", params, 60);
         McpCallToolResult callResult = MAPPER.treeToValue(result, McpCallToolResult.class);
-        String formatted = callResult.formatForLlm();
+        ToolOutput output = callResult.toToolOutput();
         if (callResult.isError()) {
-            return "MCP 工具返回错误: " + formatted;
+            return new ToolOutput("MCP 工具返回错误: " + output.text(), output.imageParts());
         }
-        return formatted;
+        return output;
     }
 
     public List<McpResourceDescriptor> listResources() throws IOException {

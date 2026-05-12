@@ -39,4 +39,15 @@ public interface HitlHandler {
      * 在 /clear 或新会话开始时调用
      */
     void clearApprovedAll();
+
+    default boolean isApprovedAllByTool(String toolName) {
+        return false;
+    }
+
+    default boolean isApprovedAllByServer(String serverName) {
+        return false;
+    }
+
+    default void clearApprovedAllForServer(String serverName) {
+    }
 }

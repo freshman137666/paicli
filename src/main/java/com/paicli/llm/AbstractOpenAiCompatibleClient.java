@@ -46,6 +46,10 @@ public abstract class AbstractOpenAiCompatibleClient implements LlmClient {
 
     protected abstract String getApiKey();
 
+    protected boolean shouldSendReasoningContentInRequestHistory() {
+        return false;
+    }
+
     @Override
     public ChatResponse chat(List<Message> messages, List<Tool> tools) throws IOException {
         return chat(messages, tools, StreamListener.NO_OP);
@@ -83,6 +87,7 @@ public abstract class AbstractOpenAiCompatibleClient implements LlmClient {
             List<ToolCallAccumulator> toolAccumulators = new ArrayList<>();
             int inputTokens = 0;
             int outputTokens = 0;
+            int cachedInputTokens = 0;
 
             while (!source.exhausted()) {
                 String line = source.readUtf8Line();
@@ -108,6 +113,7 @@ public abstract class AbstractOpenAiCompatibleClient implements LlmClient {
                 if (!usage.isMissingNode()) {
                     inputTokens = usage.path("prompt_tokens").asInt(inputTokens);
                     outputTokens = usage.path("completion_tokens").asInt(outputTokens);
+                    cachedInputTokens = parseCachedInputTokens(usage, cachedInputTokens);
                 }
 
                 JsonNode choices = root.path("choices");
@@ -150,9 +156,25 @@ public abstract class AbstractOpenAiCompatibleClient implements LlmClient {
                     reasoning.toString(),
                     buildToolCalls(toolAccumulators),
                     inputTokens,
-                    outputTokens
+                    outputTokens,
+                    cachedInputTokens
             );
         }
+    }
+
+    private int parseCachedInputTokens(JsonNode usage, int fallback) {
+        int cached = usage.path("cached_tokens").asInt(fallback);
+        cached = usage.path("prompt_cache_hit_tokens").asInt(cached);
+        cached = usage.path("input_cache_hit_tokens").asInt(cached);
+        JsonNode promptDetails = usage.path("prompt_tokens_details");
+        if (!promptDetails.isMissingNode()) {
+            cached = promptDetails.path("cached_tokens").asInt(cached);
+        }
+        JsonNode inputDetails = usage.path("input_tokens_details");
+        if (!inputDetails.isMissingNode()) {
+            cached = inputDetails.path("cached_tokens").asInt(cached);
+        }
+        return cached;
     }
 
     private ObjectNode buildRequestBody(List<Message> messages, List<Tool> tools) {
@@ -164,8 +186,10 @@ public abstract class AbstractOpenAiCompatibleClient implements LlmClient {
         for (Message msg : messages) {
             ObjectNode msgNode = messagesArray.addObject();
             msgNode.put("role", msg.role());
-            msgNode.put("content", msg.content());
-            if (msg.reasoningContent() != null && !msg.reasoningContent().isBlank()) {
+            appendMessageContent(msgNode, msg);
+            if (shouldSendReasoningContentInRequestHistory()
+                    && msg.reasoningContent() != null
+                    && !msg.reasoningContent().isBlank()) {
                 msgNode.put("reasoning_content", msg.reasoningContent());
             }
 
@@ -198,6 +222,53 @@ public abstract class AbstractOpenAiCompatibleClient implements LlmClient {
             }
         }
         return requestBody;
+    }
+
+    private void appendMessageContent(ObjectNode msgNode, Message msg) {
+        if (!msg.hasContentParts()) {
+            msgNode.put("content", msg.content());
+            return;
+        }
+
+        ArrayNode contentArray = msgNode.putArray("content");
+        for (LlmClient.ContentPart part : msg.contentParts()) {
+            if (part == null) {
+                continue;
+            }
+            if (part.isText()) {
+                if (part.text() != null && !part.text().isBlank()) {
+                    ObjectNode textNode = contentArray.addObject();
+                    textNode.put("type", "text");
+                    textNode.put("text", part.text());
+                }
+                continue;
+            }
+            if (part.isImage()) {
+                String imageUrl = toImageUrl(part);
+                if (imageUrl == null || imageUrl.isBlank()) {
+                    continue;
+                }
+                ObjectNode imageNode = contentArray.addObject();
+                imageNode.put("type", "image_url");
+                ObjectNode imageUrlNode = imageNode.putObject("image_url");
+                imageUrlNode.put("url", imageUrl);
+            }
+        }
+
+        if (contentArray.isEmpty()) {
+            msgNode.put("content", msg.content());
+        }
+    }
+
+    protected String toImageUrl(LlmClient.ContentPart part) {
+        if ("image_url".equals(part.type())) {
+            return part.imageUrl();
+        }
+        if ("image_base64".equals(part.type())) {
+            String mimeType = part.mimeType() == null || part.mimeType().isBlank() ? "image/png" : part.mimeType();
+            return "data:" + mimeType + ";base64," + part.imageBase64();
+        }
+        return null;
     }
 
     private void mergeToolCallDeltas(List<ToolCallAccumulator> accumulators, JsonNode toolCallsNode) {

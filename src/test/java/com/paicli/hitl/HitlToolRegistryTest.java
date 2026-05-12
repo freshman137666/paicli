@@ -3,6 +3,12 @@ package com.paicli.hitl;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import com.fasterxml.jackson.databind.node.JsonNodeFactory;
+import com.paicli.browser.BrowserGuard;
+import com.paicli.browser.BrowserSession;
+import com.paicli.browser.SensitivePagePolicy;
+import com.paicli.mcp.protocol.McpToolDescriptor;
+
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -132,6 +138,54 @@ class HitlToolRegistryTest {
     }
 
     @Test
+    void approvedAllByServerDecisionExecutesMcpTool() {
+        StubHandler stub = new StubHandler(req -> ApprovalResult.approveAllByServer());
+        HitlToolRegistry registry = new HitlToolRegistry(stub);
+        registerMcpTool(registry, "chrome-devtools", "navigate_page", args -> "navigated");
+
+        String result = registry.executeTool("mcp__chrome-devtools__navigate_page",
+                "{\"url\":\"https://example.com\"}");
+
+        assertEquals("navigated", result);
+        assertEquals(1, stub.requestCount());
+    }
+
+    @Test
+    void approvedAllByServerCacheSkipsApprovalForSameMcpServer() {
+        StubHandler stub = new StubHandler(req -> {
+            throw new AssertionError("server 维度已放行后不应再次触发审批");
+        });
+        stub.approveServer("chrome-devtools");
+        HitlToolRegistry registry = new HitlToolRegistry(stub);
+        registerMcpTool(registry, "chrome-devtools", "click", args -> "clicked");
+
+        String result = registry.executeTool("mcp__chrome-devtools__click", "{\"uid\":\"1\"}");
+
+        assertEquals("clicked", result);
+        assertEquals(0, stub.requestCount());
+    }
+
+    @Test
+    void sensitiveBrowserToolBypassesApprovedAllByServerCache(@TempDir Path tempDir) throws Exception {
+        Path rules = tempDir.resolve("sensitive_patterns.txt");
+        Files.writeString(rules, "*://example.com/admin/*\n");
+        BrowserSession session = new BrowserSession();
+        session.switchToShared("http://127.0.0.1:9222");
+        session.rememberNavigation("https://example.com/admin/users");
+        StubHandler stub = new StubHandler(req -> ApprovalResult.approve());
+        stub.approveServer("chrome-devtools");
+        HitlToolRegistry registry = new HitlToolRegistry(stub);
+        registry.setBrowserGuard(new BrowserGuard(session, new SensitivePagePolicy(rules)));
+        registerMcpTool(registry, "chrome-devtools", "click", args -> "clicked");
+
+        String result = registry.executeTool("mcp__chrome-devtools__click", "{\"uid\":\"1\"}");
+
+        assertEquals("clicked", result);
+        assertEquals(1, stub.requestCount());
+        assertNotNull(stub.received.get(0).sensitiveNotice());
+    }
+
+    @Test
     void nonDangerousToolSkipsApprovalEvenWhenEnabled() {
         StubHandler stub = new StubHandler(req -> {
             throw new AssertionError("non-dangerous 工具不应触发审批");
@@ -147,6 +201,7 @@ class HitlToolRegistryTest {
     private static final class StubHandler implements HitlHandler {
         private final Function<ApprovalRequest, ApprovalResult> decision;
         private final List<ApprovalRequest> received = new ArrayList<>();
+        private final List<String> approvedServers = new ArrayList<>();
         private boolean enabled = true;
 
         StubHandler(Function<ApprovalRequest, ApprovalResult> decision) {
@@ -176,5 +231,25 @@ class HitlToolRegistryTest {
         int requestCount() {
             return received.size();
         }
+
+        void approveServer(String serverName) {
+            approvedServers.add(serverName);
+        }
+
+        @Override
+        public boolean isApprovedAllByServer(String serverName) {
+            return approvedServers.contains(serverName);
+        }
+    }
+
+    private static void registerMcpTool(HitlToolRegistry registry, String serverName, String toolName,
+                                        Function<String, String> invoker) {
+        registry.registerMcpTool(new McpToolDescriptor(
+                serverName,
+                toolName,
+                McpToolDescriptor.namespaced(serverName, toolName),
+                "test tool",
+                JsonNodeFactory.instance.objectNode()
+        ), invoker);
     }
 }

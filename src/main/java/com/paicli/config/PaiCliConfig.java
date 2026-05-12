@@ -28,6 +28,8 @@ public class PaiCliConfig {
         private String apiKey;
         private String baseUrl;
         private String model;
+        private double temperature = 0.7;  // 默认温度
+        private int maxTokens = 8192;      // 默认最大 token 数
 
         public ProviderConfig() {}
 
@@ -43,6 +45,10 @@ public class PaiCliConfig {
         public void setBaseUrl(String baseUrl) { this.baseUrl = baseUrl; }
         public String getModel() { return model; }
         public void setModel(String model) { this.model = model; }
+        public double getTemperature() { return temperature; }
+        public void setTemperature(double temperature) { this.temperature = temperature; }
+        public int getMaxTokens() { return maxTokens; }
+        public void setMaxTokens(int maxTokens) { this.maxTokens = maxTokens; }
     }
 
     public String getDefaultProvider() { return defaultProvider; }
@@ -64,6 +70,14 @@ public class PaiCliConfig {
             return providerConfig.getModel();
         }
         return loadModelFromEnv(provider);
+    }
+
+    public String getBaseUrl(String provider) {
+        ProviderConfig providerConfig = providers.get(provider);
+        if (providerConfig != null && providerConfig.getBaseUrl() != null && !providerConfig.getBaseUrl().isBlank()) {
+            return providerConfig.getBaseUrl();
+        }
+        return loadBaseUrlFromEnv(provider);
     }
 
     public static PaiCliConfig load() {
@@ -90,6 +104,7 @@ public class PaiCliConfig {
         String envKey = switch (provider.toLowerCase()) {
             case "glm" -> "GLM_MODEL";
             case "deepseek" -> "DEEPSEEK_MODEL";
+            case "kimi" -> "KIMI_MODEL";
             default -> provider.toUpperCase() + "_MODEL";
         };
 
@@ -103,6 +118,17 @@ public class PaiCliConfig {
             return dotEnvValue.trim();
         }
 
+        if ("kimi".equalsIgnoreCase(provider)) {
+            String moonshotValue = System.getenv("MOONSHOT_MODEL");
+            if (moonshotValue != null && !moonshotValue.isBlank()) {
+                return moonshotValue.trim();
+            }
+            String moonshotDotEnvValue = readFromDotEnv("MOONSHOT_MODEL");
+            if (moonshotDotEnvValue != null && !moonshotDotEnvValue.isBlank()) {
+                return moonshotDotEnvValue.trim();
+            }
+        }
+
         return null;
     }
 
@@ -110,6 +136,8 @@ public class PaiCliConfig {
         String envKey = switch (provider.toLowerCase()) {
             case "glm" -> "GLM_API_KEY";
             case "deepseek" -> "DEEPSEEK_API_KEY";
+            case "step" -> "STEP_API_KEY";
+            case "kimi" -> "KIMI_API_KEY";
             default -> provider.toUpperCase() + "_API_KEY";
         };
 
@@ -121,6 +149,48 @@ public class PaiCliConfig {
         String dotEnvValue = readFromDotEnv(envKey);
         if (dotEnvValue != null && !dotEnvValue.isBlank()) {
             return dotEnvValue.trim();
+        }
+
+        if ("kimi".equalsIgnoreCase(provider)) {
+            String moonshotValue = System.getenv("MOONSHOT_API_KEY");
+            if (moonshotValue != null && !moonshotValue.isBlank()) {
+                return moonshotValue.trim();
+            }
+            String moonshotDotEnvValue = readFromDotEnv("MOONSHOT_API_KEY");
+            if (moonshotDotEnvValue != null && !moonshotDotEnvValue.isBlank()) {
+                return moonshotDotEnvValue.trim();
+            }
+        }
+
+        return null;
+    }
+
+    private static String loadBaseUrlFromEnv(String provider) {
+        String envKey = switch (provider.toLowerCase()) {
+            case "step" -> "STEP_BASE_URL";
+            case "kimi" -> "KIMI_BASE_URL";
+            default -> provider.toUpperCase() + "_BASE_URL";
+        };
+
+        String envValue = System.getenv(envKey);
+        if (envValue != null && !envValue.isBlank()) {
+            return envValue.trim();
+        }
+
+        String dotEnvValue = readFromDotEnv(envKey);
+        if (dotEnvValue != null && !dotEnvValue.isBlank()) {
+            return dotEnvValue.trim();
+        }
+
+        if ("kimi".equalsIgnoreCase(provider)) {
+            String moonshotValue = System.getenv("MOONSHOT_BASE_URL");
+            if (moonshotValue != null && !moonshotValue.isBlank()) {
+                return moonshotValue.trim();
+            }
+            String moonshotDotEnvValue = readFromDotEnv("MOONSHOT_BASE_URL");
+            if (moonshotDotEnvValue != null && !moonshotDotEnvValue.isBlank()) {
+                return moonshotDotEnvValue.trim();
+            }
         }
 
         return null;

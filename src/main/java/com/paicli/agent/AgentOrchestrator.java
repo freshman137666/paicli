@@ -15,6 +15,7 @@ import java.io.PrintStream;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.function.Supplier;
 
 /**
  * Agent 编排器 - Multi-Agent 系统的"主"
@@ -49,6 +50,7 @@ public class AgentOrchestrator {
     private final SubAgent reviewer;
     private final MemoryManager memoryManager;
     private final ToolRegistry toolRegistry;
+    private Supplier<String> externalContextSupplier = () -> "";
 
     // 执行步骤的数据结构（package-private 供测试访问）
     record ExecutionStep(String id, String description, String type,
@@ -86,6 +88,8 @@ public class AgentOrchestrator {
     public AgentOrchestrator(LlmClient llmClient, ToolRegistry toolRegistry, MemoryManager memoryManager) {
         this.llmClient = llmClient;
         this.toolRegistry = toolRegistry;
+        this.toolRegistry.setContextProfile(memoryManager.getContextProfile());
+        this.toolRegistry.setMemorySaver(memoryManager::storeFact);
         this.planner = new SubAgent("planner", AgentRole.PLANNER, llmClient, toolRegistry);
         this.workers = List.of(
                 new SubAgent("worker-1", AgentRole.WORKER, llmClient, toolRegistry),
@@ -93,6 +97,30 @@ public class AgentOrchestrator {
         );
         this.reviewer = new SubAgent("reviewer", AgentRole.REVIEWER, llmClient, toolRegistry);
         this.memoryManager = memoryManager;
+    }
+
+    public void setExternalContextSupplier(Supplier<String> externalContextSupplier) {
+        this.externalContextSupplier = externalContextSupplier == null ? () -> "" : externalContextSupplier;
+        planner.setExternalContextSupplier(this.externalContextSupplier);
+        workers.forEach(worker -> worker.setExternalContextSupplier(this.externalContextSupplier));
+        reviewer.setExternalContextSupplier(this.externalContextSupplier);
+    }
+
+    /**
+     * 把 Skill 系统下发给所有 SubAgent。Multi-Agent 三个角色共享同一 SkillRegistry（索引一致），
+     * 但共享同一 SkillContextBuffer——简化实现，避免角色级 buffer 隔离的工程开销。
+     * 任务书 §3.6 描述的"角色独立 buffer"作为可观察的优化项暂未启用。
+     */
+    public void setSkillSystem(com.paicli.skill.SkillRegistry skillRegistry,
+                               com.paicli.skill.SkillContextBuffer skillContextBuffer) {
+        planner.setSkillRegistry(skillRegistry);
+        planner.setSkillContextBuffer(skillContextBuffer);
+        for (SubAgent worker : workers) {
+            worker.setSkillRegistry(skillRegistry);
+            worker.setSkillContextBuffer(skillContextBuffer);
+        }
+        reviewer.setSkillRegistry(skillRegistry);
+        reviewer.setSkillContextBuffer(skillContextBuffer);
     }
 
     /**

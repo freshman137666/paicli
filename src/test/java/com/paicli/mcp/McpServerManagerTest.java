@@ -15,6 +15,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -72,6 +73,7 @@ class McpServerManagerTest {
         assertTrue(registry.hasTool("mcp__demo__list_resources"));
         assertTrue(registry.hasTool("mcp__demo__read_resource"));
         assertTrue(manager.resourceCandidates().stream().anyMatch(r -> r.uri().equals("file://README.md")));
+        assertTrue(manager.resourceIndexForPrompt().contains("@demo:file://README.md"));
 
         enqueuePromptsList();
         assertTrue(manager.prompts("demo").contains("Review (review)"));
@@ -138,6 +140,20 @@ class McpServerManagerTest {
         String result = manager.restart("demo");
         assertEquals(McpServerStatus.READY, server.status(), "重启后应 READY: " + result);
         assertTrue(registry.hasTool("mcp__demo__echo"));
+    }
+
+    @Test
+    void restartWithArgsUpdatesServerConfig() {
+        McpServerConfig config = new McpServerConfig();
+        config.setCommand("definitely-missing-paicli-test-command");
+        config.setArgs(List.of("old"));
+        loadServersFromMap(Map.of("demo", config));
+
+        String result = manager.restartWithArgs("demo", List.of("new", "args"));
+
+        McpServer server = manager.server("demo");
+        assertEquals(List.of("new", "args"), server.config().getArgs());
+        assertTrue(result.contains("重启失败"));
     }
 
     @Test

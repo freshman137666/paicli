@@ -1,6 +1,7 @@
 package com.paicli.agent;
 
 import com.paicli.llm.LlmClient;
+import com.paicli.llm.GLMClient;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
@@ -86,6 +87,32 @@ class AgentBudgetTest {
         String message = budget.describeExit(AgentBudget.ExitReason.TOKEN_BUDGET_EXCEEDED);
         assertTrue(message.contains("120"));
         assertTrue(message.contains("100"));
+    }
+
+    @Test
+    void defaultTokenBudgetIsUnlimited() {
+        // 默认不再用 80% × window 当硬限——长上下文 + 套餐用户场景下太容易撞墙。
+        // 死循环防护交给 stagnation + hardMaxIterations 两道兜底。
+        AgentBudget budget = AgentBudget.fromLlmClient(new GLMClient("test-key"));
+
+        assertEquals(Integer.MAX_VALUE, budget.tokenBudget());
+    }
+
+    @Test
+    void systemPropertyCanStillOverrideDynamicTokenBudget() {
+        String old = System.getProperty("paicli.react.token.budget");
+        try {
+            System.setProperty("paicli.react.token.budget", "12345");
+            AgentBudget budget = AgentBudget.fromLlmClient(new GLMClient("test-key"));
+
+            assertEquals(12345, budget.tokenBudget());
+        } finally {
+            if (old == null) {
+                System.clearProperty("paicli.react.token.budget");
+            } else {
+                System.setProperty("paicli.react.token.budget", old);
+            }
+        }
     }
 
     private LlmClient.ToolCall toolCall(String name, String args) {

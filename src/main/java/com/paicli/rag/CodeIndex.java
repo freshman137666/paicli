@@ -107,7 +107,7 @@ public class CodeIndex {
                             || dirName.equals("build") || dirName.equals(".git")
                             || dirName.equals(".idea") || dirName.equals(".vscode")
                             || dirName.equals("dist") || dirName.equals("out")
-                            || dirName.startsWith(".")) {
+                            || dirName.equals("evals") || dirName.startsWith(".")) {
                         return FileVisitResult.SKIP_SUBTREE;
                     }
                     return FileVisitResult.CONTINUE;

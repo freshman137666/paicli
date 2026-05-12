@@ -33,4 +33,10 @@ public interface HitlHandler {
      * @param enabled true 表示启用，false 表示关闭
      */
     void setEnabled(boolean enabled);
+
+    /**
+     * 清除本次会话中积累的"全部放行"记录
+     * 在 /clear 或新会话开始时调用
+     */
+    void clearApprovedAll();
 }

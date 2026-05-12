@@ -1,5 +1,6 @@
 package com.paicli.hitl;
 
+import com.paicli.eval.EvalRunRecorder;
 import com.paicli.policy.AuditLog;
 import com.paicli.tool.ToolRegistry;
 
@@ -15,6 +16,9 @@ import java.util.concurrent.TimeUnit;
  *
  * HITL 拒绝 / 跳过路径会写一行 audit（approver=hitl），HITL 通过后由父类 ToolRegistry 写
  * allow / policy-deny / error，HITL 审批与策略拦截共用同一份 ~/.paicli/audit/ 文件。
+ *
+ * 审批决策同时记录到 EvalRunRecorder.hitlDecisions（仅 eval 模式启用时生效），
+ * 供 eval trace 对 grader 可见。
  */
 public class HitlToolRegistry extends ToolRegistry {
 
@@ -36,6 +40,12 @@ public class HitlToolRegistry extends ToolRegistry {
         ApprovalRequest request = ApprovalRequest.of(name, argumentsJson, null);
         ApprovalResult result = hitlHandler.requestApproval(request);
 
+        // ScriptedHitlHandler 已自行写入 eval trace；TerminalHitlHandler 在此补写
+        if (!(hitlHandler instanceof ScriptedHitlHandler)) {
+            recordToEvalTrace(name, result.decision().name(),
+                    result.reason() != null ? result.reason() : "", elapsedMillis(start));
+        }
+
         if (result.isRejected()) {
             String reason = result.reason() != null && !result.reason().isBlank()
                     ? result.reason()
@@ -54,6 +64,13 @@ public class HitlToolRegistry extends ToolRegistry {
         // 批准（含修改参数）- 使用 effectiveArguments 获取最终参数；父类 executeTool 会负责 allow audit
         String effectiveArgs = result.effectiveArguments(argumentsJson);
         return super.executeTool(name, effectiveArgs);
+    }
+
+    private void recordToEvalTrace(String toolName, String decision, String reason, long durationMs) {
+        EvalRunRecorder recorder = EvalRunRecorder.current();
+        if (recorder != null && EvalRunRecorder.isEnabled()) {
+            recorder.recordHitlDecision(toolName, decision, reason, durationMs);
+        }
     }
 
     private static long elapsedMillis(long startNanos) {

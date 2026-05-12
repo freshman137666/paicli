@@ -169,6 +169,10 @@ class HitlToolRegistryTest {
             this.enabled = enabled;
         }
 
+        @Override
+        public void clearApprovedAll() {
+        }
+
         int requestCount() {
             return received.size();
         }

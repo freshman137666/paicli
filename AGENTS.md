@@ -144,6 +144,19 @@ mvn test
 mvn test -Dtest=CodeChunkerTest,CodeAnalyzerTest,VectorStoreTest,CodeIndexTest
 ```
 
+Eval 模式运行：
+
+```bash
+java -Dpaicli.eval.trace.dir=/path/to/trace -Dpaicli.eval.hitl.decisions='[{"toolPattern":"execute_command","decision":"REJECTED","reason":"dangerous"}]' -jar target/paicli-1.0-SNAPSHOT.jar --eval-input /path/to/task.md
+```
+
+Eval 模式配置读取顺序（以代码实际行为为准）：
+
+1. `-Dpaicli.eval.trace.dir` 系统属性 或 `PAICLI_EVAL_TRACE_DIR` 环境变量：启用 eval trace 写入（`trace.json` + `usage.json`）
+2. `-Dpaicli.eval.hitl.decisions` 系统属性：JSON 数组，注入 HITL 决策（`ScriptedHitlHandler` 替代 `TerminalHitlHandler`）
+3. `--eval-input <file>` CLI 参数：非交互模式，从文件读取任务输入，运行后退出
+4. 仅设置 trace dir 而不设置 hitl decisions 时，HITL 默认启用但走 `ScriptedHitlHandler(true, List.of())`，所有危险工具默认 REJECT
+
 如果只是验证一个测试类：
 
 ```bash
@@ -254,7 +267,10 @@ mvn test -Dtest=ExecutionPlanTest
   - `s`：跳过本步骤
   - `m`：修改参数后执行
 - 关键设计：`HitlToolRegistry` 继承 `ToolRegistry`，通过覆写 `executeTool()` 实现透明拦截；HITL 关闭时与普通 `ToolRegistry` 行为完全一致
-- `/clear` 命令同时清除本次会话中积累的"全部放行"记录
+- `< clear` 命令同时清除本次会话中积累的"全部放行"记录
+- HITL 处理器有两个实现：交互模式用 `TerminalHitlHandler`（终端交互审批），eval 模式用 `ScriptedHitlHandler`（返回预配置决策，不读 stdin）
+- eval 模式通过 `-Dpaicli.eval.hitl.decisions=...` 系统属性注入 HITL 决策，格式为 JSON 数组 `[{"toolPattern":"execute_command","decision":"REJECTED","reason":"dangerous"}]`
+- `HitlHandler` 接口新增 `clearApprovedAll()` 方法，两个实现都支持
 - fail-safe：无法识别的输入会重新提示，**不会**默认批准；连续 5 次无效输入则保守判为 REJECTED
 - 修改参数（`m`）输入的 JSON 会先用 Jackson 校验语法，非法则提示并回到主菜单重选
 - 并发安全：`TerminalHitlHandler.requestApproval` 整体 `synchronized`，多 Agent 并行场景下审批提示会串行展示、避免 stdout / stdin 互相打架；`approvedAllTools` 使用 `ConcurrentHashMap.newKeySet()`
@@ -262,6 +278,7 @@ mvn test -Dtest=ExecutionPlanTest
 - 参数展示按 JSON 结构解析逐字段展示；长字符串（> 120 字符）显示前 120 字符预览 + 总长度，换行替换为 `⏎` 以便肉眼可读
 - 审批框上方会打印 `────────── ⚠️ HITL 审批请求 ──────────` 作为视觉分隔符，与上游 `🤖 回复` / `执行输出` 区视觉分离
 - 流式渲染器在进入 tool-call 迭代前会调用 `resetBetweenIterations()`：`TerminalMarkdownRenderer` 按换行才 flush，没做这一步 HITL 提示会"跨过"还在 pending 缓冲区里的 reasoning/content 文本，造成标题与内容错位。Agent / SubAgent / PlanExecuteAgent 三条路径都做了相同处理；其中 ReAct 会重建渲染器但不会重复打印同一次用户输入的 `🧠 思考过程` 标题
+- HITL 审批决策同时记录到 `EvalRunRecorder.hitlDecisions`（仅 eval 模式启用时生效）：`ScriptedHitlHandler` 在 `requestApproval()` 内自行写入；`TerminalHitlHandler` 通过 `HitlToolRegistry.executeTool()` 补写。Grader 可从 trace.json 的 `hitlDecisions` 字段读取
 
 #### 7.1 HITL 增强：路径围栏 / 命令快速拒绝 / 操作审计
 
@@ -396,6 +413,7 @@ src/main/java/com/paicli
 │   ├── ApprovalRequest.java
 │   ├── ApprovalResult.java
 │   ├── HitlHandler.java
+│   ├── ScriptedHitlHandler.java
 │   ├── TerminalHitlHandler.java
 │   └── HitlToolRegistry.java
 ├── web/
@@ -440,6 +458,7 @@ src/main/java/com/paicli
 - `ApprovalPolicyTest`
 - `ApprovalResultTest`
 - `HitlToolRegistryTest`
+- `ScriptedHitlHandlerTest`
 - `TerminalHitlHandlerTest`
 - `ToolRegistryTest`
 - `McpSchemaSanitizerTest`、`McpConfigLoaderTest`、`JsonRpcClientTest`、`McpToolBridgeTest`、`McpResourceCacheTest`、`AtMentionParserTest`、`AtMentionExpanderTest`、`AtMentionCompleterTest`、`NotificationRouterTest`
@@ -677,7 +696,18 @@ src/main/java/com/paicli
 - `README.md` 与 `AGENTS.md`：HITL 增强子段 + 命令列表
 - 至少补一个对应的单元测试（`PathGuardTest` / `CommandGuardTest` / `AuditLogTest`）
 
-### 5.5 改 MCP 协议或 server 管理，要联动这几处
+### 5.5 改 HITL 处理器或 eval 跟踪，要联动这几处
+
+如果新增 HITL 处理器（如 `ScriptedHitlHandler`）、修改审批决策记录、或调整 eval 跟踪：
+
+- `src/main/java/com/paicli/hitl/` 下相关文件
+- `HitlToolRegistry.java`：HITL 审批与 eval trace 记录的协调
+- `Main.java`：HITL handler 创建逻辑（eval 模式 vs 交互模式）
+- `EvalRunRecorder.java`：`hitlDecisions` 字段与 `recordHitlDecision()` 方法
+- `AGENTS.md` 的 HITL 章节和 eval 运行器配置
+- 至少补一个对应的单元测试（`ScriptedHitlHandlerTest` / `HitlToolRegistryTest`）
+
+### 5.6 改 MCP 协议或 server 管理，要联动这几处
 
 如果新增 MCP transport、调整配置格式、改变工具命名、改 `tools/list` / `tools/call` / `resources/list` / `resources/read` 行为、调整 `@server:protocol://path` 输入层、或新增 `/mcp` 子命令：
 

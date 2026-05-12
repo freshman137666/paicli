@@ -21,3 +21,19 @@ skills/
 # 操作系统
 .DS_Store
 Thumbs.db
+ 
+# Local planning / helper files
+AGENT_EVAL_PLAN.md
+run.ps1
+nul
+
+# Eval run artifacts
+evals/**
+
+
+# Temporary analysis docs
+docs/final-team-summary-hitl-deny-flow.md
+docs/hitl-mechanism-analysis.md
+docs/hitl-reject-writefile-explanation.md
+docs/team-summary-hitl-deny-flow.md
+docs/team-summary.md

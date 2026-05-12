@@ -176,10 +176,7 @@ public class TerminalHitlHandler implements HitlHandler {
         return ApprovalResult.modify(trimmed);
     }
 
-    /**
-     * 清除本次会话中积累的"全部放行"记录
-     * 在 /clear 或新会话开始时调用
-     */
+    @Override
     public void clearApprovedAll() {
         approvedAllTools.clear();
     }

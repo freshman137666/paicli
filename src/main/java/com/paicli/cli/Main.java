@@ -4,7 +4,10 @@ import com.paicli.agent.Agent;
 import com.paicli.agent.AgentOrchestrator;
 import com.paicli.agent.PlanExecuteAgent;
 import com.paicli.config.PaiCliConfig;
+import com.paicli.eval.EvalRunRecorder;
+import com.paicli.hitl.HitlHandler;
 import com.paicli.hitl.HitlToolRegistry;
+import com.paicli.hitl.ScriptedHitlHandler;
 import com.paicli.hitl.TerminalHitlHandler;
 import com.paicli.llm.LlmClient;
 import com.paicli.llm.LlmClientFactory;
@@ -113,7 +116,33 @@ public class Main {
         }
     }
 
+    private static HitlHandler createHitlHandler() {
+        String evalHitlFile = System.getProperty("paicli.eval.hitl.decisions.file");
+        if (evalHitlFile != null && !evalHitlFile.isBlank()) {
+            return ScriptedHitlHandler.fromFile(evalHitlFile);
+        }
+        String evalHitlDecisions = System.getProperty("paicli.eval.hitl.decisions");
+        if (evalHitlDecisions != null && !evalHitlDecisions.isBlank()) {
+            return ScriptedHitlHandler.fromSystemProperty(evalHitlDecisions);
+        }
+        String evalTraceDir = System.getProperty("paicli.eval.trace.dir");
+        String evalEnvDir = System.getenv("PAICLI_EVAL_TRACE_DIR");
+        boolean evalMode = (evalTraceDir != null && !evalTraceDir.isBlank())
+                || (evalEnvDir != null && !evalEnvDir.isBlank());
+        if (evalMode) {
+            return new ScriptedHitlHandler(true, List.of());
+        }
+        return new TerminalHitlHandler(false);
+    }
+
     public static void main(String[] args) {
+        String evalInputFile = null;
+        for (int i = 0; i < args.length; i++) {
+            if ("--eval-input".equals(args[i]) && i + 1 < args.length) {
+                evalInputFile = args[++i];
+            }
+        }
+
         printBanner();
         configureLogging();
 
@@ -128,7 +157,7 @@ public class Main {
         System.out.println("✅ 已加载模型: " + llmClient.getModelName() + " (" + llmClient.getProviderName() + ")\n");
 
         try (Terminal terminal = TerminalBuilder.builder().system(true).build()) {
-            TerminalHitlHandler hitlHandler = new TerminalHitlHandler(false);
+            HitlHandler hitlHandler = createHitlHandler();
             HitlToolRegistry hitlToolRegistry = new HitlToolRegistry(hitlHandler);
             McpServerManager mcpServerManager = new McpServerManager(hitlToolRegistry, Path.of("."));
             try {
@@ -150,6 +179,12 @@ public class Main {
 
             Agent reactAgent = new Agent(llmClient, hitlToolRegistry);
             System.out.println("🔄 使用 ReAct 模式\n");
+
+            if (evalInputFile != null) {
+                runEvalMode(reactAgent, evalInputFile);
+                return;
+            }
+
             boolean nextTaskUsePlanMode = false;
             boolean nextTaskUseTeamMode = false;
 
@@ -1060,5 +1095,35 @@ public class Main {
         System.out.println("║                                                          ║");
         System.out.println("╚══════════════════════════════════════════════════════════╝");
         System.out.println();
+    }
+
+    private static void runEvalMode(Agent agent, String inputFile) {
+        try {
+            String content = Files.readString(Path.of(inputFile));
+            if (content.isBlank()) {
+                System.err.println("⚠️ eval-input 文件为空: " + inputFile);
+                return;
+            }
+
+            String traceDir = System.getProperty("paicli.eval.trace.dir");
+            if (traceDir == null || traceDir.isBlank()) {
+                traceDir = System.getenv("PAICLI_EVAL_TRACE_DIR");
+            }
+
+            EvalRunRecorder recorder = EvalRunRecorder.startIfEnabled(
+                    "react", content.trim(), null, null);
+            try {
+                String result = agent.run(content.trim());
+                if (result != null) {
+                    System.out.println(result);
+                }
+                recorder.finish(result != null ? result : "");
+            } finally {
+                recorder.close();
+            }
+        } catch (Exception e) {
+            System.err.println("❌ eval 模式执行失败: " + e.getMessage());
+            e.printStackTrace(System.err);
+        }
     }
 }

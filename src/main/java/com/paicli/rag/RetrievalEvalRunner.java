@@ -49,7 +49,7 @@ public class RetrievalEvalRunner {
             new QuerySpec("q07", "How does the planner generate execution plans?",
                     List.of("Planner.java")),
             new QuerySpec("q08", "How does MCP tool bridge route calls to external servers?",
-                    List.of("McpToolBridge.java")),
+                    List.of("McpServerManager.java")),
             new QuerySpec("q09", "How does the network policy block localhost and private IPs?",
                     List.of("NetworkPolicy.java")),
             new QuerySpec("q10", "How does the VectorStore perform similarity search?",

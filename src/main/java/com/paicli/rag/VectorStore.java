@@ -4,6 +4,7 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
 import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.sql.*;
 import java.util.ArrayList;
 import java.util.List;
@@ -20,7 +21,7 @@ public class VectorStore implements AutoCloseable {
     private final String projectPath;
 
     public VectorStore(String projectPath) throws SQLException {
-        this.projectPath = projectPath;
+        this.projectPath = Paths.get(projectPath).toAbsolutePath().normalize().toString();
         String dbDir = System.getProperty("paicli.rag.dir",
                 System.getProperty("user.home") + "/.paicli/rag");
         java.io.File dir = new java.io.File(dbDir);

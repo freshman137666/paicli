@@ -154,15 +154,17 @@ public class ImageReferenceParser {
     // 这里只关心拿到本地路径字符串，所以自己做一次宽容的 percent-decode：合法的 %XX 解码，
     // 其他字符（包括空格、中文、未编码字节）原样保留。
     private static String fileUriToLocalPath(String value) {
-        String afterScheme = value.substring("file://".length());
-        String pathPart;
-        if (afterScheme.startsWith("/")) {
-            pathPart = afterScheme;
-        } else {
-            int slashIdx = afterScheme.indexOf('/');
-            pathPart = slashIdx < 0 ? "/" + afterScheme : afterScheme.substring(slashIdx);
+        String afterScheme = percentDecodeUtf8(value.substring("file://".length()));
+        if (afterScheme.matches("^[A-Za-z]:[\\\\/].*")) {
+            return afterScheme;
         }
-        return percentDecodeUtf8(pathPart);
+        if (afterScheme.matches("^/[A-Za-z]:[\\\\/].*")) {
+            return afterScheme.substring(1);
+        }
+        if (afterScheme.startsWith("//")) {
+            return "\\\\" + afterScheme.substring(2);
+        }
+        return afterScheme;
     }
 
     private static String percentDecodeUtf8(String s) {

@@ -1,5 +1,7 @@
 package com.paicli.llm;
 
+import com.fasterxml.jackson.databind.node.ObjectNode;
+
 public class DeepSeekClient extends AbstractOpenAiCompatibleClient {
 
     private static final String API_URL = "https://api.deepseek.com/chat/completions";
@@ -37,8 +39,32 @@ public class DeepSeekClient extends AbstractOpenAiCompatibleClient {
     }
 
     @Override
+    protected boolean shouldSendReasoningContentInRequestHistory() {
+        return true;
+    }
+
+    @Override
     public String getProviderName() {
         return "deepseek";
+    }
+
+    @Override
+    protected boolean supportsVision() {
+        return false; // DeepSeek 云端 API 目前不支持图片/多模态输入
+    }
+
+    @Override
+    protected void appendMessageContent(ObjectNode msgNode, Message msg) {
+        if (msg.hasImageContent()) {
+            int count = msg.imagePartCount();
+            StringBuilder sb = new StringBuilder(msg.content());
+            sb.append("\n\n[模型限制] DeepSeek 云端 API 当前不支持图片/视觉输入，已省略 ")
+                    .append(count).append(" 张图片。");
+            sb.append("\n如需图片识别，请使用 /model glm-5v-turbo 切换到智谱 GLM-5V-Turbo 多模态模型。");
+            msgNode.put("content", sb.toString());
+            return;
+        }
+        super.appendMessageContent(msgNode, msg);
     }
 
     @Override

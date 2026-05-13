@@ -2,6 +2,9 @@ package com.paicli.mcp.config;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileReader;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -101,7 +104,13 @@ public class McpConfigLoader {
             String value = switch (name) {
                 case "PROJECT_DIR" -> projectDir.toString();
                 case "HOME" -> System.getProperty("user.home");
-                default -> System.getenv(name);
+                default -> {
+                    String env = System.getenv(name);
+                    if (env != null && !env.isBlank()) {
+                        yield env;
+                    }
+                    yield readFromDotEnv(name);
+                }
             };
             if (value == null || value.isBlank()) {
                 throw new IllegalArgumentException("MCP 配置引用了未设置的环境变量: " + name);
@@ -110,6 +119,24 @@ public class McpConfigLoader {
         }
         matcher.appendTail(sb);
         return sb.toString();
+    }
+
+    private static String readFromDotEnv(String key) {
+        File[] envFiles = {new File(".env"), new File(System.getProperty("user.home"), ".env")};
+        for (File envFile : envFiles) {
+            if (!envFile.exists()) continue;
+            try (BufferedReader reader = new BufferedReader(new FileReader(envFile))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    line = line.trim();
+                    if (line.isEmpty() || line.startsWith("#")) continue;
+                    if (line.startsWith(key + "=")) {
+                        return line.substring((key + "=").length()).trim();
+                    }
+                }
+            } catch (IOException ignored) {}
+        }
+        return null;
     }
 
     private void validate(McpServerConfig config) {

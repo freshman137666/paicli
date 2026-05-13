@@ -241,9 +241,6 @@ public class Main {
                     System.out.println(bootstrapResult.message());
                 }
                 mcpServerManager.loadConfiguredServers();
-                if (!mcpServerManager.servers().isEmpty()) {
-                    System.out.println("🔌 启动 MCP server（" + mcpServerManager.servers().size() + " 个）...");
-                }
                 mcpServerManager.startAll(System.out);
                 Runtime.getRuntime().addShutdownHook(new Thread(mcpServerManager::close, "paicli-mcp-shutdown"));
                 System.out.println(mcpServerManager.startupSummary());
@@ -439,7 +436,8 @@ public class Main {
                             System.out.println("   其它 provider 使用你配置里的具体模型：");
                             System.out.println("   /model deepseek      - 切换到 DeepSeek（读取配置模型）");
                             System.out.println("   /model step          - 切换到 StepFun（读取配置模型）");
-                            System.out.println("   /model kimi          - 切换到 Kimi（读取配置模型）\n");
+                            System.out.println("   /model kimi          - 切换到 Kimi（读取配置模型）");
+                            System.out.println("   /model llava         - 切换到本地 LLaVA 视觉模型\n");
                         } else {
                             ModelSelection target = resolveModelSelection(selection);
                             if (target.explicitModel()) {
@@ -1147,6 +1145,7 @@ public class Main {
                 new SlashCommandHint("/model deepseek", "/model deepseek", "切换到 DeepSeek（读取配置模型）"),
                 new SlashCommandHint("/model step", "/model step", "切换到 StepFun（读取配置模型）"),
                 new SlashCommandHint("/model kimi", "/model kimi", "切换到 Kimi（读取配置模型）"),
+                new SlashCommandHint("/model llava", "/model llava", "切换到本地 LLaVA 视觉模型"),
                 new SlashCommandHint("/plan", "/plan", "下一条任务使用 Plan-and-Execute 模式"),
                 new SlashCommandHint("/plan ", "/plan <任务内容>", "直接用计划模式执行这条任务"),
                 new SlashCommandHint("/team", "/team", "下一条任务使用 Multi-Agent 协作模式"),
@@ -1289,7 +1288,7 @@ public class Main {
             return;
         }
         String hint = switch (selected) {
-            case 0, 1 -> "💡 GLM: /model glm-5.1 / /model glm-5v-turbo；其它: /model deepseek|step|kimi 读取配置模型";
+            case 0, 1 -> "💡 GLM: /model glm-5.1 / /model glm-5v-turbo；其它: /model deepseek|step|kimi|llava";
             case 2 -> "💡 切换 HITL: /hitl on / /hitl off";
             case 3 -> "💡 管理 Skill: /skill list / /skill on <name> / /skill off <name>";
             case 4 -> "💡 切换渲染器（重启后生效）: PAICLI_RENDERER=inline|lanterna|plain";
@@ -1453,7 +1452,9 @@ public class Main {
         List<String> autoConnectArgs = List.of("-y", "chrome-devtools-mcp@latest", "--autoConnect");
         String result = mcpServerManager.restartWithArgs("chrome-devtools", autoConnectArgs);
         McpServer restarted = mcpServerManager.server("chrome-devtools");
-        if (restarted != null && restarted.status() == McpServerStatus.READY) {
+        if (restarted != null
+                && restarted.status() == McpServerStatus.READY
+                && canListBrowserPages(restarted)) {
             browserSession.switchToShared("autoConnect");
             hitlHandler.clearApprovedAllForServer("chrome-devtools");
             return "🔄 已用 --autoConnect 连接 Chrome（需已在 chrome://inspect/#remote-debugging 允许远程调试）\n" + result;
@@ -1485,7 +1486,9 @@ public class Main {
         List<String> sharedArgs = List.of("-y", "chrome-devtools-mcp@latest", "--browser-url=" + probe.browserUrl());
         String result = mcpServerManager.restartWithArgs("chrome-devtools", sharedArgs);
         McpServer restarted = mcpServerManager.server("chrome-devtools");
-        if (restarted != null && restarted.status() == McpServerStatus.READY) {
+        if (restarted != null
+                && restarted.status() == McpServerStatus.READY
+                && canListBrowserPages(restarted)) {
             browserSession.switchToShared(probe.browserUrl());
             hitlHandler.clearApprovedAllForServer("chrome-devtools");
             return "🔄 切换 chrome-devtools server 到 shared 模式 (" + probe.browserUrl() + ")\n" + result;
@@ -1514,7 +1517,50 @@ public class Main {
         if (browserSession.mode() != BrowserMode.SHARED) {
             return "当前为 isolated 模式，没有真实 Chrome tab 可复用。可用 /browser connect 切到 shared 模式。";
         }
-        return registry.executeTool("mcp__chrome-devtools__list_pages", "{}");
+        String result = registry.executeTool("mcp__chrome-devtools__list_pages", "{}");
+        if (result.contains("TimeoutException") || result.contains("JSON-RPC request timed out: tools/call")) {
+            try {
+                Thread.sleep(500);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            String retryResult = registry.executeTool("mcp__chrome-devtools__list_pages", "{}");
+            if (!(retryResult.contains("TimeoutException") || retryResult.contains("JSON-RPC request timed out: tools/call"))) {
+                return retryResult;
+            }
+            result = retryResult;
+            return """
+                    ❌ 列出 Chrome tabs 超时。
+
+                    当前会话虽然被标记为 shared，但 chrome-devtools 没有在超时时间内返回页面列表。
+                    这通常意味着 shared 浏览器会话没有真正连上，或者 Chrome 的远程调试连接已失效。
+
+                    建议依次执行：
+                      1. /browser status
+                      2. /browser disconnect
+                      3. /browser connect 9222   （如果你是手动用 --remote-debugging-port 启动 Chrome）
+                         或 /browser connect     （如果你走 autoConnect）
+
+                    原始错误：
+                    %s
+                    """.formatted(result).trim();
+        }
+        return result;
+    }
+
+    private static boolean canListBrowserPages(McpServer server) {
+        if (server == null || server.status() != McpServerStatus.READY) {
+            return false;
+        }
+        if (server.client() == null) {
+            return true;
+        }
+        try {
+            server.client().callTool("list_pages", "{}");
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     private static int parseBrowserPort(String value) {
@@ -1832,6 +1878,7 @@ public class Main {
             case "deepseek" -> new ModelSelection("deepseek", null, false);
             case "step", "stepfun", "step-fun" -> new ModelSelection("step", null, false);
             case "kimi", "moonshot", "moonshotai", "moonshot-ai" -> new ModelSelection("kimi", null, false);
+            case "ollama", "llava" -> new ModelSelection("llava", null, false);
             default -> {
                 if (normalized.startsWith("glm-")) {
                     yield new ModelSelection("glm", value, true);
@@ -1844,6 +1891,10 @@ public class Main {
                 }
                 if (normalized.startsWith("kimi-") || normalized.startsWith("moonshot-")) {
                     yield new ModelSelection("kimi", value, true);
+                }
+                if (normalized.startsWith("llava") || normalized.startsWith("minicpm")
+                        || normalized.startsWith("bakllava")) {
+                    yield new ModelSelection("llava", value, true);
                 }
                 yield new ModelSelection(normalized, null, false);
             }

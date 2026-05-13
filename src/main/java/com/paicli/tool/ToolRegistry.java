@@ -956,7 +956,7 @@ public class ToolRegistry {
 
         Process process = null;
         try {
-            ProcessBuilder pb = new ProcessBuilder("bash", "-c", normalized);
+            ProcessBuilder pb = new ProcessBuilder(buildShellCommand(normalized));
             pb.directory(new File(projectPath));
             pb.redirectErrorStream(true);
             process = pb.start();
@@ -966,8 +966,7 @@ public class ToolRegistry {
 
             boolean finished = process.waitFor(commandTimeoutSeconds, TimeUnit.SECONDS);
             if (!finished) {
-                process.destroyForcibly();
-                process.waitFor(2, TimeUnit.SECONDS);
+                destroyProcessTree(process);
                 outputFuture.cancel(true);
                 return "命令执行超时（" + commandTimeoutSeconds + "秒），已强制终止";
             }
@@ -978,16 +977,64 @@ public class ToolRegistry {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             if (process != null) {
-                process.destroyForcibly();
+                destroyProcessTree(process);
             }
             return "用户取消了此次工具调用";
         } catch (Exception e) {
             if (process != null) {
-                process.destroyForcibly();
+                destroyProcessTree(process);
             }
             return "执行命令失败: " + e.getMessage();
         } finally {
             outputReaderExecutor.shutdownNow();
+        }
+    }
+
+    private List<String> buildShellCommand(String command) {
+        String osName = System.getProperty("os.name", "").toLowerCase(Locale.ROOT);
+        if (osName.contains("win")) {
+            return List.of("powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command);
+        }
+        return List.of("bash", "-c", command);
+    }
+
+    private void destroyProcessTree(Process process) {
+        if (process == null) {
+            return;
+        }
+        ProcessHandle handle = process.toHandle();
+        List<ProcessHandle> descendants = handle.descendants().toList();
+        descendants.forEach(descendant -> {
+            try {
+                descendant.destroyForcibly();
+            } catch (Exception ignored) {
+            }
+        });
+        process.destroyForcibly();
+        try {
+            for (ProcessHandle descendant : descendants) {
+                try {
+                    descendant.onExit().get(2, TimeUnit.SECONDS);
+                } catch (Exception ignored) {
+                }
+            }
+            process.onExit().get(2, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } catch (Exception ignored) {
+        } finally {
+            try {
+                process.getInputStream().close();
+            } catch (Exception ignored) {
+            }
+            try {
+                process.getErrorStream().close();
+            } catch (Exception ignored) {
+            }
+            try {
+                process.getOutputStream().close();
+            } catch (Exception ignored) {
+            }
         }
     }
 

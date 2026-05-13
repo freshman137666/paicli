@@ -77,6 +77,9 @@ public class AgentOrchestrator {
         PENDING, RUNNING, COMPLETED, FAILED
     }
 
+    private record ParallelStepOutput(String stepId, String text) {
+    }
+
     public AgentOrchestrator(LlmClient llmClient) {
         this(llmClient, new ToolRegistry(), new MemoryManager(llmClient));
     }
@@ -407,16 +410,15 @@ public class AgentOrchestrator {
             return t;
         });
         BlockingQueue<SubAgent> workerPool = new LinkedBlockingQueue<>(workers);
-        Map<String, ByteArrayOutputStream> buffers = new ConcurrentHashMap<>();
-        List<Future<?>> futures = new ArrayList<>();
+        CompletionService<ParallelStepOutput> completionService =
+                new ExecutorCompletionService<>(executor);
 
         for (ExecutionStep step : batch) {
-            ByteArrayOutputStream baos = new ByteArrayOutputStream();
-            buffers.put(step.id(), baos);
-            PrintStream stepOut = new PrintStream(baos, true, StandardCharsets.UTF_8);
             String context = buildStepContext(steps, step);
 
-            futures.add(executor.submit(() -> {
+            completionService.submit(() -> {
+                ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                PrintStream stepOut = new PrintStream(baos, true, StandardCharsets.UTF_8);
                 SubAgent worker = null;
                 SubAgent localReviewer = new SubAgent(
                         "reviewer-" + step.id(), AgentRole.REVIEWER, llmClient, toolRegistry);
@@ -437,31 +439,31 @@ public class AgentOrchestrator {
                         workerPool.offer(worker);
                     }
                     stepOut.flush();
+                    stepOut.close();
                 }
-                return null;
-            }));
+                return new ParallelStepOutput(step.id(), baos.toString(StandardCharsets.UTF_8));
+            });
         }
 
-        for (Future<?> f : futures) {
-            try {
-                f.get();
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                log.warn("Batch wait interrupted");
-            } catch (ExecutionException e) {
-                log.error("Parallel step task failed", e.getCause());
+        try {
+            for (int i = 0; i < batch.size(); i++) {
+                Future<ParallelStepOutput> future = completionService.take();
+                ParallelStepOutput output = future.get();
+                if (output != null && output.text() != null && !output.text().isBlank()) {
+                    System.out.print(output.text());
+                    System.out.flush();
+                }
             }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            log.warn("Batch wait interrupted");
+        } catch (ExecutionException e) {
+            log.error("Parallel step task failed", e.getCause());
+        } finally {
+            executor.shutdownNow();
         }
-        executor.shutdownNow();
 
         // 按 step_id 顺序 flush 各步骤的缓冲输出，保证用户看到的执行过程有稳定顺序
-        for (ExecutionStep step : batch) {
-            ByteArrayOutputStream buf = buffers.get(step.id());
-            if (buf != null && buf.size() > 0) {
-                System.out.print(buf.toString(StandardCharsets.UTF_8));
-                System.out.flush();
-            }
-        }
     }
 
     /**

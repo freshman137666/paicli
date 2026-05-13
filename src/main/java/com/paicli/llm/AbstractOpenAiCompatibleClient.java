@@ -50,6 +50,10 @@ public abstract class AbstractOpenAiCompatibleClient implements LlmClient {
         return false;
     }
 
+    protected boolean supportsVision() {
+        return false;
+    }
+
     @Override
     public ChatResponse chat(List<Message> messages, List<Tool> tools) throws IOException {
         return chat(messages, tools, StreamListener.NO_OP);
@@ -224,7 +228,7 @@ public abstract class AbstractOpenAiCompatibleClient implements LlmClient {
         return requestBody;
     }
 
-    private void appendMessageContent(ObjectNode msgNode, Message msg) {
+    protected void appendMessageContent(ObjectNode msgNode, Message msg) {
         if (!msg.hasContentParts()) {
             msgNode.put("content", msg.content());
             return;

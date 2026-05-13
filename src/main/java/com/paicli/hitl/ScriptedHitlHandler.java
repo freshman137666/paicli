@@ -22,6 +22,7 @@ public class ScriptedHitlHandler implements HitlHandler {
 
     private final List<HitlDecision> decisions;
     private final Set<String> approvedAllTools = ConcurrentHashMap.newKeySet();
+    private final Set<String> approvedAllServers = ConcurrentHashMap.newKeySet();
     private volatile boolean enabled;
 
     public record HitlDecision(String toolPattern, String decision, String reason) {
@@ -29,6 +30,7 @@ public class ScriptedHitlHandler implements HitlHandler {
             return switch (decision.toUpperCase()) {
                 case "APPROVED" -> ApprovalResult.Decision.APPROVED;
                 case "APPROVED_ALL" -> ApprovalResult.Decision.APPROVED_ALL;
+                case "APPROVED_ALL_BY_SERVER" -> ApprovalResult.Decision.APPROVED_ALL_BY_SERVER;
                 case "REJECTED" -> ApprovalResult.Decision.REJECTED;
                 case "SKIPPED" -> ApprovalResult.Decision.SKIPPED;
                 case "MODIFIED" -> ApprovalResult.Decision.MODIFIED;
@@ -94,12 +96,17 @@ public class ScriptedHitlHandler implements HitlHandler {
     @Override
     public void clearApprovedAll() {
         approvedAllTools.clear();
+        approvedAllServers.clear();
     }
 
     @Override
     public ApprovalResult requestApproval(ApprovalRequest request) {
+        String mcpServer = ApprovalPolicy.mcpServerName(request.toolName());
         if (approvedAllTools.contains(request.toolName())) {
             return ApprovalResult.approveAll();
+        }
+        if (mcpServer != null && approvedAllServers.contains(mcpServer)) {
+            return ApprovalResult.approveAllByServer();
         }
 
         for (HitlDecision d : decisions) {
@@ -107,6 +114,8 @@ public class ScriptedHitlHandler implements HitlHandler {
                 ApprovalResult result = toResult(d);
                 if (result.isApprovedAll()) {
                     approvedAllTools.add(request.toolName());
+                } else if (result.isApprovedAllForServer() && mcpServer != null) {
+                    approvedAllServers.add(mcpServer);
                 }
                 recordToEvalTrace(request.toolName(), d);
                 return result;
@@ -122,6 +131,7 @@ public class ScriptedHitlHandler implements HitlHandler {
         return switch (d.asDecision()) {
             case APPROVED -> ApprovalResult.approve();
             case APPROVED_ALL -> ApprovalResult.approveAll();
+            case APPROVED_ALL_BY_SERVER -> ApprovalResult.approveAllByServer();
             case REJECTED -> ApprovalResult.reject(d.reason());
             case SKIPPED -> ApprovalResult.skip();
             case MODIFIED -> ApprovalResult.modify(d.reason());

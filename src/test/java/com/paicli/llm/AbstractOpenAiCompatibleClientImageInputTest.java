@@ -260,6 +260,40 @@ class AbstractOpenAiCompatibleClientImageInputTest {
                 stripped.content());
     }
 
+    @Test
+    void ollamaClientUsesNativeApiWithImagesArray() throws Exception {
+        try (MockWebServer server = new MockWebServer()) {
+            server.enqueue(new MockResponse()
+                    .setHeader("Content-Type", "application/x-ndjson")
+                    .setBody("""
+                            {"model":"llava:13b","created_at":"2024-01-01T00:00:00Z","message":{"role":"assistant","content":"ok"},"done":false}
+                            {"model":"llava:13b","created_at":"2024-01-01T00:00:00Z","message":{"role":"assistant","content":""},"done":true,"prompt_eval_count":12,"eval_count":1}
+                            """));
+            OllamaClient client = new OllamaClient("llava:13b", server.url("/api").toString());
+
+            client.chat(List.of(LlmClient.Message.user(List.of(
+                    LlmClient.ContentPart.text("看图"),
+                    LlmClient.ContentPart.imageBase64("aGVsbG8=", "image/png")
+            ))), null);
+
+            RecordedRequest request = server.takeRequest();
+            assertEquals("/api/chat", request.getPath());
+            JsonNode root = MAPPER.readTree(request.getBody().readUtf8());
+            JsonNode msg = root.path("messages").get(0);
+
+            assertEquals("user", msg.path("role").asText());
+            assertEquals("看图", msg.path("content").asText());
+            assertEquals("aGVsbG8=", msg.path("images").get(0).asText());
+        }
+    }
+
+    @Test
+    void ollamaClientDefaultUrlIsLocalhost() {
+        OllamaClient client = new OllamaClient();
+        assertEquals("llava:13b", client.getModelName());
+        assertEquals("ollama", client.getProviderName());
+    }
+
     private static final class TestClient extends AbstractOpenAiCompatibleClient {
         private final String apiUrl;
 

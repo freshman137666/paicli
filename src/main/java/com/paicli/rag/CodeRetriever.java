@@ -16,6 +16,7 @@ import java.util.Set;
  * 代码检索器：语义检索 + 图谱检索的统一入口
  */
 public class CodeRetriever implements AutoCloseable {
+    private static final double DUAL_MATCH_BONUS = 0.25;
     private final EmbeddingClient embeddingClient;
     private final VectorStore vectorStore;
 
@@ -91,7 +92,7 @@ public class CodeRetriever implements AutoCloseable {
             double best = Math.max(existing.similarity(), candidate.similarity());
             // 双重命中奖励只给一次，不重复叠加
             if (!dualMatchBonused.contains(key)) {
-                best += 0.1;
+                best += DUAL_MATCH_BONUS;
                 dualMatchBonused.add(key);
             }
             merged.put(key, new VectorStore.SearchResult(

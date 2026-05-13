@@ -64,6 +64,11 @@ public class GLMClient extends AbstractOpenAiCompatibleClient {
     }
 
     @Override
+    protected boolean supportsVision() {
+        return isGlm5v();
+    }
+
+    @Override
     protected String toImageUrl(LlmClient.ContentPart part) {
         if (isGlm5v() && "image_base64".equals(part.type())) {
             return part.imageBase64();

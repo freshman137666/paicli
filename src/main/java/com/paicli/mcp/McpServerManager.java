@@ -87,6 +87,11 @@ public class McpServerManager implements AutoCloseable {
         } finally {
             if (progressPrinter != null) {
                 progressPrinter.interrupt();
+                try {
+                    progressPrinter.join(1000);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
             }
             executor.shutdown();
         }

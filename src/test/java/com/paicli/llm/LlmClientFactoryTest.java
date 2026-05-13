@@ -76,6 +76,30 @@ class LlmClientFactoryTest {
     }
 
     @Test
+    void createsOllamaClientWithoutApiKey() {
+        PaiCliConfig config = new PaiCliConfig();
+        config.getProviders().put("llava",
+                new PaiCliConfig.ProviderConfig(null, "http://localhost:11434/v1", "minicpm-v:latest"));
+
+        LlmClient client = LlmClientFactory.create("llava", config);
+
+        OllamaClient ollamaClient = assertInstanceOf(OllamaClient.class, client);
+        assertEquals("ollama", ollamaClient.getProviderName());
+        assertEquals("minicpm-v:latest", ollamaClient.getModelName());
+        assertEquals(4_096, ollamaClient.maxContextWindow());
+    }
+
+    @Test
+    void createsOllamaClientWithDefaultsWhenNoConfig() {
+        PaiCliConfig config = new PaiCliConfig();
+        LlmClient client = LlmClientFactory.create("llava", config);
+
+        OllamaClient ollamaClient = assertInstanceOf(OllamaClient.class, client);
+        assertEquals("ollama", ollamaClient.getProviderName());
+        // 无配置时回退到默认 llava:13b；若有 LLAVA_MODEL 环境变量则优先使用
+    }
+
+    @Test
     void returnsNullForUnknownProvider() {
         PaiCliConfig config = new PaiCliConfig();
         config.getProviders().put("unknown", new PaiCliConfig.ProviderConfig("test-key", null, "unknown-model"));

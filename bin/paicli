@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+#
+# PaiCLI 启动脚本 - 可从任意目录调用
+# 用法: 将 bin/ 目录加入 PATH，然后直接运行 paicli
+#
+# 例如:
+#   export PATH="$PATH:/path/to/paicli/bin"
+#   paicli
+#
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+JAR="$PROJECT_DIR/target/paicli-1.0-SNAPSHOT.jar"
+ENV_FILE="$PROJECT_DIR/.env"
+
+# 自动加载项目 .env，不影响已有环境变量
+if [ -f "$ENV_FILE" ]; then
+    set -a
+    # source 会处理注释行和空行；不覆盖已有变量由下面的逻辑保证
+    while IFS='=' read -r key value; do
+        # 跳过注释和空行
+        [[ -z "$key" || "$key" =~ ^[[:space:]]*# ]] && continue
+        # 去除首尾空白
+        key="${key%"${key##*[![:space:]]}"}"
+        key="${key#"${key%%[![:space:]]*}"}"
+        # 跳过空 key
+        [[ -z "$key" ]] && continue
+        # 不覆盖已有的环境变量
+        if [ -n "${!key:+x}" ]; then
+            continue
+        fi
+        export "$key=$value"
+    done < <(grep -v '^\s*#' "$ENV_FILE" 2>/dev/null || true)
+    set +a
+fi
+
+if [ ! -f "$JAR" ]; then
+    echo "Error: PaiCLI jar not found at $JAR"
+    echo "Please run 'mvn clean package' first."
+    exit 1
+fi
+
+exec java -jar "$JAR" "$@"

@@ -2,6 +2,7 @@ package com.paicli.agent;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.paicli.eval.EvalRunRecorder;
 import com.paicli.llm.LlmClient;
 import com.paicli.memory.MemoryManager;
 import com.paicli.runtime.CancellationContext;
@@ -409,6 +410,7 @@ public class AgentOrchestrator {
             t.setDaemon(true);
             return t;
         });
+        EvalRunRecorder parentRecorder = EvalRunRecorder.current();
         BlockingQueue<SubAgent> workerPool = new LinkedBlockingQueue<>(workers);
         CompletionService<ParallelStepOutput> completionService =
                 new ExecutorCompletionService<>(executor);
@@ -417,6 +419,9 @@ public class AgentOrchestrator {
             String context = buildStepContext(steps, step);
 
             completionService.submit(() -> {
+                if (parentRecorder != null) {
+                    EvalRunRecorder.propagateFrom(parentRecorder);
+                }
                 ByteArrayOutputStream baos = new ByteArrayOutputStream();
                 PrintStream stepOut = new PrintStream(baos, true, StandardCharsets.UTF_8);
                 SubAgent worker = null;
@@ -428,10 +433,12 @@ public class AgentOrchestrator {
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     updateStep(steps, step.id(), step.withFailed("并行执行被中断"));
+                    recordTeamStep(step.id(), "FAILED", worker != null ? worker.getName() : "unknown", false, 0, null);
                     stepOut.println("❌ 步骤 [" + step.id() + "] 被中断\n");
                 } catch (RuntimeException e) {
                     log.error("Parallel step {} failed unexpectedly", step.id(), e);
                     updateStep(steps, step.id(), step.withFailed("并行执行异常: " + e.getMessage()));
+                    recordTeamStep(step.id(), "FAILED", worker != null ? worker.getName() : "unknown", false, 0, null);
                     stepOut.println("❌ 步骤 [" + step.id() + "] 并行执行异常：" + e.getMessage() + "\n");
                 } finally {
                     if (worker != null) {
@@ -479,6 +486,7 @@ public class AgentOrchestrator {
         if (CancellationContext.isCancelled()) {
             updateStep(steps, step.id(), step.withFailed("用户取消"));
             out.println("⏹️ 步骤 [" + step.id() + "] 已取消\n");
+            recordTeamStep(step.id(), "FAILED", worker.getName(), false, 0, null);
             return;
         }
 
@@ -487,17 +495,20 @@ public class AgentOrchestrator {
         if (CancellationContext.isCancelled()) {
             updateStep(steps, step.id(), step.withFailed("用户取消"));
             out.println("⏹️ 步骤 [" + step.id() + "] 已取消\n");
+            recordTeamStep(step.id(), "FAILED", worker.getName(), false, 0, null);
             return;
         }
 
         if (result.type() == AgentMessage.Type.ERROR) {
             updateStep(steps, step.id(), step.withFailed(result.content()));
             out.println("❌ 步骤 [" + step.id() + "] 执行失败：" + result.content() + "\n");
+            recordTeamStep(step.id(), "FAILED", worker.getName(), false, 0, result.content());
             return;
         }
         if (result.content() == null || result.content().isBlank()) {
             updateStep(steps, step.id(), step.withFailed("执行结果为空"));
             out.println("❌ 步骤 [" + step.id() + "] 执行失败：结果为空\n");
+            recordTeamStep(step.id(), "FAILED", worker.getName(), false, 0, null);
             return;
         }
 
@@ -509,6 +520,7 @@ public class AgentOrchestrator {
             log.warn("Reviewer failed for step {}: {}", step.id(), reviewResult.content());
             out.println("⚠️ 步骤 [" + step.id() + "] 审查阶段 LLM 调用失败，保留当前执行结果\n");
             updateStep(steps, step.id(), step.withResult(result.content()));
+            recordTeamStep(step.id(), "COMPLETED", worker.getName(), false, 0, result.content());
             return;
         }
 
@@ -518,6 +530,7 @@ public class AgentOrchestrator {
         if (approved) {
             updateStep(steps, step.id(), step.withResult(acceptedResult));
             out.println("✅ 步骤 [" + step.id() + "] 审查通过\n");
+            recordTeamStep(step.id(), "COMPLETED", worker.getName(), true, 0, acceptedResult);
             return;
         }
 
@@ -565,8 +578,10 @@ public class AgentOrchestrator {
         updateStep(steps, step.id(), step.withResult(acceptedResult));
         if (approved) {
             out.println("✅ 步骤 [" + step.id() + "] 重试后审查通过\n");
+            recordTeamStep(step.id(), "COMPLETED", worker.getName(), true, retries, acceptedResult);
         } else {
             out.println("⚠️ 步骤 [" + step.id() + "] 超过最大重试次数，保留当前结果\n");
+            recordTeamStep(step.id(), "COMPLETED", worker.getName(), false, retries, acceptedResult);
         }
     }
 
@@ -643,5 +658,19 @@ public class AgentOrchestrator {
         }
 
         return result.toString();
+    }
+
+    private void recordTeamStep(String stepId, String status, String workerName, boolean approved, int retries, String result) {
+        EvalRunRecorder recorder = EvalRunRecorder.current();
+        if (recorder != null && EvalRunRecorder.isEnabled()) {
+            recorder.recordTeamStep(stepId, status, workerName, approved, retries, previewResult(result, 500));
+        }
+    }
+
+    private static String previewResult(String value, int maxLen) {
+        if (value == null || value.length() <= maxLen) {
+            return value == null ? "" : value;
+        }
+        return value.substring(0, maxLen) + "...";
     }
 }

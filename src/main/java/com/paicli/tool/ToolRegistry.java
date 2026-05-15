@@ -19,6 +19,7 @@ import com.paicli.policy.AuditLog;
 import com.paicli.policy.CommandGuard;
 import com.paicli.policy.PathGuard;
 import com.paicli.policy.PolicyException;
+import com.paicli.eval.EvalRunRecorder;
 import com.paicli.runtime.CancellationContext;
 import com.paicli.snapshot.RestoreResult;
 import com.paicli.snapshot.SnapshotService;
@@ -55,6 +56,8 @@ public class ToolRegistry {
     // write_file 单次写入字节数上限。LLM 想塞超大内容时通常是误生成（重复粘贴 / hallucinate 大段日志），
     // 5MB 对常规代码生成 / 文档撰写完全够用，超过即拒，避免磁盘灌满与误覆盖。
     private static final int MAX_WRITE_FILE_BYTES = 5 * 1024 * 1024;
+    // eval 模式下由 executeTools 设置，供 doExecuteTool 记录 toolCallId
+    private static final ThreadLocal<String> CURRENT_TOOL_CALL_ID = new ThreadLocal<>();
     // 需要审计的内置工具（与 ApprovalPolicy 的 DANGEROUS_TOOLS 保持一致）；MCP 工具按前缀动态纳入审计。
     private static final Set<String> AUDIT_TOOLS = Set.of("write_file", "execute_command", "create_project", "revert_turn");
     private final Map<String, Tool> tools = new ConcurrentHashMap<>();
@@ -782,6 +785,7 @@ public class ToolRegistry {
                 if (browserCheck.blocked()) {
                     throw new PolicyException(browserCheck.reason());
                 }
+                long mcpStart = System.nanoTime();
                 ToolOutput output = mcpTool.invoker().apply(argumentsJson);
                 if (output == null) {
                     output = ToolOutput.text("");
@@ -789,9 +793,11 @@ public class ToolRegistry {
                 if (browserGuard != null) {
                     browserGuard.applyAfterExecution(name, argumentsJson, output.text());
                 }
+                long mcpElapsed = elapsedMillis(mcpStart);
                 if (shouldAudit) {
-                    auditLog.record(AuditLog.AuditEntry.allow(name, argumentsJson, elapsedMillis(start), auditMetadata));
+                    auditLog.record(AuditLog.AuditEntry.allow(name, argumentsJson, mcpElapsed, auditMetadata));
                 }
+                recordToolCallToEval(name, argumentsJson, output.text(), mcpElapsed, false);
                 return output;
             }
 
@@ -799,22 +805,29 @@ public class ToolRegistry {
             Map<String, String> argMap = new HashMap<>();
             args.fields().forEachRemaining(entry ->
                     argMap.put(entry.getKey(), entry.getValue().asText()));
+            long builtinStart = System.nanoTime();
             String result = tool.executor().execute(argMap);
+            long builtinElapsed = elapsedMillis(builtinStart);
             if (shouldAudit) {
-                auditLog.record(AuditLog.AuditEntry.allow(name, argumentsJson, elapsedMillis(start), auditMetadata));
+                auditLog.record(AuditLog.AuditEntry.allow(name, argumentsJson, builtinElapsed, auditMetadata));
             }
+            recordToolCallToEval(name, argumentsJson, result, builtinElapsed, false);
             return ToolOutput.text(result);
         } catch (PolicyException e) {
+            long policyElapsed = elapsedMillis(start);
             if (shouldAudit) {
                 auditLog.record(AuditLog.AuditEntry.denyByPolicy(
-                        name, argumentsJson, e.getMessage(), elapsedMillis(start), auditMetadata));
+                        name, argumentsJson, e.getMessage(), policyElapsed, auditMetadata));
             }
+            recordPolicyDenialToEval(name, e.getMessage(), policyElapsed);
             return ToolOutput.text("🛡️ 策略拒绝: " + e.getMessage());
         } catch (Exception e) {
+            long errorElapsed = elapsedMillis(start);
             if (shouldAudit) {
                 auditLog.record(AuditLog.AuditEntry.error(
-                        name, argumentsJson, e.getMessage(), elapsedMillis(start), auditMetadata));
+                        name, argumentsJson, e.getMessage(), errorElapsed, auditMetadata));
             }
+            recordToolCallToEval(name, argumentsJson, "工具执行失败: " + e.getMessage(), errorElapsed, false);
             return ToolOutput.text("工具执行失败: " + e.getMessage());
         }
     }
@@ -857,9 +870,14 @@ public class ToolRegistry {
         }
         if (invocations.size() == 1) {
             ToolInvocation invocation = invocations.get(0);
-            long startedAt = System.nanoTime();
-            ToolOutput output = executeToolOutput(invocation.name(), invocation.argumentsJson());
-            return List.of(ToolExecutionResult.completed(invocation, output, elapsedMillis(startedAt)));
+            CURRENT_TOOL_CALL_ID.set(invocation.id());
+            try {
+                long startedAt = System.nanoTime();
+                ToolOutput output = executeToolOutput(invocation.name(), invocation.argumentsJson());
+                return List.of(ToolExecutionResult.completed(invocation, output, elapsedMillis(startedAt)));
+            } finally {
+                CURRENT_TOOL_CALL_ID.remove();
+            }
         }
 
         int parallelism = Math.min(invocations.size(), MAX_PARALLEL_TOOLS);
@@ -869,15 +887,25 @@ public class ToolRegistry {
             return thread;
         });
 
+        EvalRunRecorder parentRecorder = EvalRunRecorder.current();
+
         try {
             List<Callable<ToolExecutionResult>> tasks = invocations.stream()
                     .<Callable<ToolExecutionResult>>map(invocation -> () -> {
-                        if (CancellationContext.isCancelled()) {
-                            return ToolExecutionResult.failed(invocation, "用户取消了此次工具调用");
+                        if (parentRecorder != null) {
+                            EvalRunRecorder.propagateFrom(parentRecorder);
                         }
-                        long startedAt = System.nanoTime();
-                        ToolOutput output = executeToolOutput(invocation.name(), invocation.argumentsJson());
-                        return ToolExecutionResult.completed(invocation, output, elapsedMillis(startedAt));
+                        CURRENT_TOOL_CALL_ID.set(invocation.id());
+                        try {
+                            if (CancellationContext.isCancelled()) {
+                                return ToolExecutionResult.failed(invocation, "用户取消了此次工具调用");
+                            }
+                            long startedAt = System.nanoTime();
+                            ToolOutput output = executeToolOutput(invocation.name(), invocation.argumentsJson());
+                            return ToolExecutionResult.completed(invocation, output, elapsedMillis(startedAt));
+                        } finally {
+                            CURRENT_TOOL_CALL_ID.remove();
+                        }
                     })
                     .toList();
 
@@ -919,6 +947,21 @@ public class ToolRegistry {
 
     private long elapsedMillis(long startedAtNanos) {
         return TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAtNanos);
+    }
+
+    private void recordToolCallToEval(String name, String argumentsJson, String result, long durationMs, boolean timedOut) {
+        EvalRunRecorder recorder = EvalRunRecorder.current();
+        if (recorder != null && EvalRunRecorder.isEnabled()) {
+            String id = CURRENT_TOOL_CALL_ID.get();
+            recorder.recordToolCall(id != null ? id : "", name, argumentsJson, result, durationMs, timedOut);
+        }
+    }
+
+    private void recordPolicyDenialToEval(String name, String reason, long durationMs) {
+        EvalRunRecorder recorder = EvalRunRecorder.current();
+        if (recorder != null && EvalRunRecorder.isEnabled()) {
+            recorder.recordPolicyDenial(name, reason, durationMs);
+        }
     }
 
     public boolean hasTool(String name) {

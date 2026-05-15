@@ -4,6 +4,7 @@ import com.paicli.llm.LlmClient;
 import com.paicli.llm.LlmTraceLogger;
 import com.paicli.context.ContextProfile;
 import com.paicli.context.TokenUsageFormatter;
+import com.paicli.eval.EvalRunRecorder;
 import com.paicli.lsp.LspDiagnosticReport;
 import com.paicli.memory.ConversationHistoryCompactor;
 import com.paicli.memory.ExplicitMemoryHints;
@@ -33,6 +34,7 @@ import java.io.PrintStream;
 import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.util.concurrent.TimeUnit;
 import java.util.HexFormat;
 import java.util.ArrayList;
 import java.util.List;
@@ -167,11 +169,14 @@ public class Agent {
                 List<LlmClient.Tool> toolDefinitions = toolRegistry.getToolDefinitions();
                 logRequestContext("react iteration=" + iteration, toolDefinitions);
                 // 调用 LLM
+                long llmStart = System.nanoTime();
                 LlmClient.ChatResponse response = llmClient.chat(
                         conversationHistory,
                         toolDefinitions,
                         streamRenderer
                 );
+                long llmLatencyMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - llmStart);
+                recordLlmCallIfEnabled(response, llmLatencyMs);
                 LlmTraceLogger.logReasoning(log, "react iteration=" + iteration, llmClient, response.reasoningContent());
                 if (CancellationContext.isCancelled()) {
                     log.info("ReAct run cancelled after LLM response");
@@ -654,6 +659,14 @@ public class Agent {
      * 4. 如果 content 启动之后又收到 reasoning（服务器把思考内容追加在答案之后），
      *    缓冲到 lateReasoning，最终在 finish() 用"🧠 补充思考"标题独立展示，不会污染回复区
      */
+
+    private void recordLlmCallIfEnabled(LlmClient.ChatResponse response, long latencyMs) {
+        EvalRunRecorder recorder = EvalRunRecorder.current();
+        if (recorder != null && EvalRunRecorder.isEnabled()) {
+            recorder.recordLlmCall(response.inputTokens(), response.outputTokens(), latencyMs);
+        }
+    }
+
     private static final class StreamRenderer implements LlmClient.StreamListener {
         private final PrintStream boundOut;  // null 表示延迟读取 System.out（保持旧测试兼容）
         private final StringBuilder pendingReasoning = new StringBuilder();

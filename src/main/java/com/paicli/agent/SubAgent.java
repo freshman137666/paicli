@@ -3,6 +3,7 @@ package com.paicli.agent;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.paicli.context.TokenUsageFormatter;
+import com.paicli.eval.EvalRunRecorder;
 import com.paicli.llm.LlmClient;
 import com.paicli.llm.LlmTraceLogger;
 import com.paicli.lsp.LspDiagnosticReport;
@@ -30,6 +31,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 
 /**
@@ -194,11 +196,14 @@ public class SubAgent {
             maybeCompactHistory(out);
 
             try {
+                long llmStart = System.nanoTime();
                 LlmClient.ChatResponse response = llmClient.chat(
                         conversationHistory,
                         shouldUseTools() ? toolRegistry.getToolDefinitions() : null,
                         streamRenderer
                 );
+                long llmLatencyMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - llmStart);
+                recordLlmCallIfEnabled(response, llmLatencyMs);
                 LlmTraceLogger.logReasoning(log,
                         "sub-agent name=" + name + " role=" + role + " iteration=" + budget.iteration(),
                         llmClient,
@@ -582,6 +587,13 @@ public class SubAgent {
             if (streamedOutput) {
                 out.println("\n");
             }
+        }
+    }
+
+    private void recordLlmCallIfEnabled(LlmClient.ChatResponse response, long latencyMs) {
+        EvalRunRecorder recorder = EvalRunRecorder.current();
+        if (recorder != null && EvalRunRecorder.isEnabled()) {
+            recorder.recordLlmCall(response.inputTokens(), response.outputTokens(), latencyMs);
         }
     }
 }

@@ -1911,12 +1911,12 @@ public class Main {
     private static void printBanner() {
         System.out.println("╔══════════════════════════════════════════════════════════╗");
         System.out.println("║                                                          ║");
-        System.out.println("║   ██╗  ██╗██╗  ██╗ ██████╗██╗     ██╗                  ║");
-        System.out.println("║   ██║  ██║██║  ██║██╔════╝██║     ██║                  ║");
-        System.out.println("║   ███████║███████║██║     ██║     ██║                  ║");
-        System.out.println("║   ██╔══██║██╔══██║██║     ██║     ██║                  ║");
-        System.out.println("║   ██║  ██║██║  ██║╚██████╗███████╗██║                  ║");
-        System.out.println("║   ╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝╚══════╝╚═╝                  ║");
+        System.out.println("║   ██████╗  █████╗ ██╗      ██████╗██╗     ██╗            ║");
+        System.out.println("║   ██╔══██╗██╔══██╗██║     ██╔════╝██║     ██║            ║");
+        System.out.println("║   ██████╔╝███████║██║     ██║     ██║     ██║            ║");
+        System.out.println("║   ██╔═══╝ ██╔══██║██║     ██║     ██║     ██║            ║");
+        System.out.println("║   ██║     ██║  ██║███████╗╚██████╗███████╗██║            ║");
+        System.out.println("║   ╚═╝     ╚═╝  ╚═╝╚══════╝ ╚═════╝╚══════╝╚═╝            ║");
         System.out.println("║                                                          ║");
         System.out.printf("║      Terminal-First Agent IDE %-23s║%n", "v" + VERSION);
         System.out.println("║                                                          ║");

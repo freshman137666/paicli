@@ -3,6 +3,7 @@ package com.paicli.agent;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.paicli.context.TokenUsageFormatter;
+import com.paicli.eval.EvalRunRecorder;
 import com.paicli.llm.LlmClient;
 import com.paicli.llm.LlmTraceLogger;
 import com.paicli.lsp.LspDiagnosticReport;
@@ -258,6 +259,7 @@ public class PlanExecuteAgent {
 
                 if (!batchResult.failed()) {
                     task.markCompleted(batchResult.result());
+                    recordPlanTask(task);
                     streamedTaskOutputs.put(task.getId(), batchResult.streamedOutput());
                     log.info("Task completed: {} status={} resultChars={}",
                             task.getId(), task.getStatus(), batchResult.result() == null ? 0 : batchResult.result().length());
@@ -272,6 +274,7 @@ public class PlanExecuteAgent {
 
                 Exception error = batchResult.error();
                 task.markFailed(error.getMessage());
+                recordPlanTask(task);
                 log.warn("Task failed: {} error={}", task.getId(), error.getMessage());
                 System.out.println("❌ 失败 [" + task.getId() + "]: " + error.getMessage() + "\n");
 
@@ -449,11 +452,14 @@ public class PlanExecuteAgent {
             injectPendingLspDiagnostics(messages, out);
             maybeCompactHistory(messages, out);
 
+            long llmStart = System.nanoTime();
             LlmClient.ChatResponse response = llmClient.chat(
                     messages,
                     toolRegistry.getToolDefinitions(),
                     streamRenderer
             );
+            long llmLatencyMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - llmStart);
+            recordLlmCallIfEnabled(response, llmLatencyMs);
             LlmTraceLogger.logReasoning(log,
                     "plan-task task=" + task.getId() + " iteration=" + iteration,
                     llmClient,
@@ -863,4 +869,28 @@ public class PlanExecuteAgent {
                 .orElse("");
     }
 
+    private void recordLlmCallIfEnabled(LlmClient.ChatResponse response, long latencyMs) {
+        EvalRunRecorder recorder = EvalRunRecorder.current();
+        if (recorder != null && EvalRunRecorder.isEnabled()) {
+            recorder.recordLlmCall(response.inputTokens(), response.outputTokens(), latencyMs);
+        }
+    }
+
+    private void recordPlanTask(Task task) {
+        EvalRunRecorder recorder = EvalRunRecorder.current();
+        if (recorder != null && EvalRunRecorder.isEnabled()) {
+            recorder.recordPlanTask(
+                    task.getId(),
+                    task.getStatus().name(),
+                    String.join(",", task.getDependencies()),
+                    preview(task.getResult(), 500));
+        }
+    }
+
+    private static String preview(String value, int maxLen) {
+        if (value == null || value.length() <= maxLen) {
+            return value == null ? "" : value;
+        }
+        return value.substring(0, maxLen) + "...";
+    }
 }

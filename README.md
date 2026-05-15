@@ -285,7 +285,47 @@ google-chrome --remote-debugging-port=9222 --user-data-dir=/tmp/paicli-chrome-pr
 
 OAuth 和 `sampling/createMessage` 当前未实现；远程 server 需要鉴权时仍使用 `headers` + 环境变量注入 Bearer token。
 
-### 3. 编译运行
+### 3. 安装到 PATH（可选，推荐）
+
+将 `bin/` 目录加入系统 PATH，即可在任意目录下直接运行 `paicli` 命令（类似 `claude`）：
+
+**Windows（CMD）：**
+```batch
+:: 临时添加
+set PATH=%PATH%;D:\Code\MyProject\paicli\bin
+
+:: 永久添加
+:: setx PATH "%PATH%;D:\Code\MyProject\paicli\bin"
+```
+
+**Windows（PowerShell）：**
+```powershell
+# 临时添加（当前会话）
+$env:PATH += ";D:\Code\MyProject\paicli\bin"
+
+# 永久添加（推荐：注入到 PowerShell profile）
+Add-Content -Path $PROFILE -Value "`n. D:\Code\MyProject\paicli\bin\paicli.ps1"
+```
+
+**Linux / macOS / Git Bash：**
+```bash
+# 临时添加
+export PATH="$PATH:/path/to/paicli/bin"
+
+# 永久添加（追加到 ~/.bashrc 或 ~/.zshrc）
+echo 'export PATH="$PATH:/path/to/paicli/bin"' >> ~/.bashrc
+```
+
+添加后即可在任何目录运行：
+
+```bash
+cd /some/project
+paicli          # 以当前目录为项目根运行
+```
+
+脚本会自动定位 jar 包，无需关心 `java -jar target/...` 的路径问题。
+
+### 4. 编译运行
 
 ```bash
 # 编译
@@ -301,7 +341,7 @@ java -jar target/paicli-1.0-SNAPSHOT.jar
 mvn clean compile exec:java -Dexec.mainClass="com.paicli.cli.Main"
 ```
 
-### 4. 如何进入 Plan 模式
+### 5. 如何进入 Plan 模式
 
 当前默认模式是 `ReAct`。进入 `Plan-and-Execute` 的方式只有 `/plan`：
 

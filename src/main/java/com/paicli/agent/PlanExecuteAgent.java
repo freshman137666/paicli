@@ -887,10 +887,4 @@ public class PlanExecuteAgent {
         }
     }
 
-    private static String preview(String value, int maxLen) {
-        if (value == null || value.length() <= maxLen) {
-            return value == null ? "" : value;
-        }
-        return value.substring(0, maxLen) + "...";
-    }
 }

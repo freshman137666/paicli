@@ -8,6 +8,7 @@ import com.paicli.browser.BrowserConnectivityCheck;
 import com.paicli.browser.BrowserGuard;
 import com.paicli.browser.BrowserMode;
 import com.paicli.browser.BrowserSession;
+import com.paicli.browser.BrowserTabManager;
 import com.paicli.browser.SensitivePagePolicy;
 import com.paicli.config.PaiCliConfig;
 import com.paicli.eval.EvalRunRecorder;
@@ -215,7 +216,9 @@ public class Main {
             BrowserSession browserSession = new BrowserSession();
             BrowserConnectivityCheck browserConnectivityCheck = new BrowserConnectivityCheck();
             hitlToolRegistry.setBrowserGuard(new BrowserGuard(browserSession, new SensitivePagePolicy()));
+            BrowserTabManager browserTabManager = new BrowserTabManager();
             McpServerManager mcpServerManager = new McpServerManager(hitlToolRegistry, Path.of("."));
+            mcpServerManager.setBrowserTabManager(browserTabManager);
             hitlToolRegistry.setBrowserConnector(new com.paicli.browser.BrowserConnector() {
                 @Override
                 public String status() {

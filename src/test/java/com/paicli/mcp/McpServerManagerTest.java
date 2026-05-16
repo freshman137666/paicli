@@ -237,4 +237,34 @@ class McpServerManagerTest {
             throw new RuntimeException(e);
         }
     }
+
+    // === normalizeNavigateUrl ===
+
+    @Test
+    void normalizeNavigateUrlAddsHttpsToBareDomain() {
+        String result = McpServerManager.normalizeNavigateUrl("{\"url\":\"linux.do\"}");
+        assertTrue(result.contains("\"https://linux.do\""), result);
+    }
+
+    @Test
+    void normalizeNavigateUrlPreservesFullUrl() {
+        String input = "{\"url\":\"https://linux.do/c/news\"}";
+        assertEquals(input, McpServerManager.normalizeNavigateUrl(input));
+    }
+
+    @Test
+    void normalizeNavigateUrlPreservesHttpUrl() {
+        String input = "{\"url\":\"http://linux.do\"}";
+        assertEquals(input, McpServerManager.normalizeNavigateUrl(input));
+    }
+
+    @Test
+    void normalizeNavigateUrlHandlesNullArgs() {
+        assertNull(McpServerManager.normalizeNavigateUrl(null));
+    }
+
+    @Test
+    void normalizeNavigateUrlHandlesEmptyArgs() {
+        assertEquals("", McpServerManager.normalizeNavigateUrl(""));
+    }
 }

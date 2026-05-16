@@ -1,5 +1,8 @@
 package com.paicli.mcp;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.paicli.browser.BrowserTabManager;
 import com.paicli.mcp.config.McpConfigLoader;
 import com.paicli.mcp.config.McpServerConfig;
 import com.paicli.mcp.notifications.NotificationRouter;
@@ -32,15 +35,19 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Function;
 
 public class McpServerManager implements AutoCloseable {
     private static final Duration STARTUP_PROGRESS_INTERVAL = Duration.ofSeconds(5);
+
+    private static final ObjectMapper MAPPER = new ObjectMapper();
 
     private final ToolRegistry toolRegistry;
     private final Path projectDir;
     private final McpConfigLoader configLoader;
     private final Map<String, McpServer> servers = new ConcurrentHashMap<>();
     private final McpResourceCache resourceCache = new McpResourceCache();
+    private BrowserTabManager browserTabManager;
 
     public McpServerManager(ToolRegistry toolRegistry, Path projectDir) {
         this(toolRegistry, projectDir, new McpConfigLoader(projectDir));
@@ -50,6 +57,10 @@ public class McpServerManager implements AutoCloseable {
         this.toolRegistry = toolRegistry;
         this.projectDir = projectDir.toAbsolutePath().normalize();
         this.configLoader = configLoader;
+    }
+
+    public void setBrowserTabManager(BrowserTabManager browserTabManager) {
+        this.browserTabManager = browserTabManager;
     }
 
     public void loadConfiguredServers() throws IOException {
@@ -394,9 +405,64 @@ public class McpServerManager implements AutoCloseable {
 
     private void replaceTools(McpServer server, McpClient client, List<McpToolDescriptor> tools) {
         toolRegistry.replaceMcpToolOutputsForServer(server.name(), tools,
-                descriptor -> isResourceVirtualTool(descriptor)
-                        ? args -> ToolOutput.text(McpResourceTool.invoker(client, descriptor).apply(args))
-                        : args -> invokeMcpToolOutput(client, descriptor, args));
+                descriptor -> wrapInvoker(server, client, descriptor));
+    }
+
+    private Function<String, ToolOutput> wrapInvoker(McpServer server, McpClient client, McpToolDescriptor descriptor) {
+        if (browserTabManager != null
+                && "chrome-devtools".equals(server.name())
+                && "navigate_page".equals(descriptor.name())) {
+            return args -> {
+                String normalizedArgs = normalizeNavigateUrl(args);
+                String targetUrl = extractUrlFromArgs(normalizedArgs);
+                if (targetUrl != null) {
+                    browserTabManager.tryReuseExistingTab(client, targetUrl);
+                }
+                return invokeMcpToolOutput(client, descriptor, normalizedArgs);
+            };
+        }
+        if (isResourceVirtualTool(descriptor)) {
+            return args -> ToolOutput.text(McpResourceTool.invoker(client, descriptor).apply(args));
+        }
+        return args -> invokeMcpToolOutput(client, descriptor, args);
+    }
+
+    /**
+     * 规范化 navigate_page 的 URL 参数：裸域名补 https:// 前缀。
+     */
+    static String normalizeNavigateUrl(String argumentsJson) {
+        if (argumentsJson == null || argumentsJson.isBlank()) {
+            return argumentsJson;
+        }
+        try {
+            JsonNode args = MAPPER.readTree(argumentsJson);
+            JsonNode urlNode = args.get("url");
+            if (urlNode == null || urlNode.isNull()) {
+                return argumentsJson;
+            }
+            String raw = urlNode.asText();
+            String normalized = BrowserTabManager.normalizeUrl(raw);
+            if (normalized.equals(raw)) {
+                return argumentsJson;
+            }
+            ((com.fasterxml.jackson.databind.node.ObjectNode) args).put("url", normalized);
+            return MAPPER.writeValueAsString(args);
+        } catch (Exception e) {
+            return argumentsJson;
+        }
+    }
+
+    private static String extractUrlFromArgs(String argumentsJson) {
+        if (argumentsJson == null || argumentsJson.isBlank()) {
+            return null;
+        }
+        try {
+            JsonNode args = MAPPER.readTree(argumentsJson);
+            JsonNode urlNode = args.get("url");
+            return urlNode == null || urlNode.isNull() ? null : urlNode.asText();
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     private boolean isResourceVirtualTool(McpToolDescriptor descriptor) {

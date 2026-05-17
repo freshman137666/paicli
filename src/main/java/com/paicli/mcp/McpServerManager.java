@@ -46,6 +46,7 @@ public class McpServerManager implements AutoCloseable {
     private final Path projectDir;
     private final McpConfigLoader configLoader;
     private final Map<String, McpServer> servers = new ConcurrentHashMap<>();
+    private final Map<String, CompletableFuture<Void>> startupFutures = new ConcurrentHashMap<>();
     private final McpResourceCache resourceCache = new McpResourceCache();
     private BrowserTabManager browserTabManager;
 
@@ -73,13 +74,34 @@ public class McpServerManager implements AutoCloseable {
         startAll(null);
     }
 
+    /**
+     * 同步启动所有 MCP server，内部复用 {@link #startAllAsync} 的 future 并等待完成。
+     */
     public void startAll(PrintStream progressOut) {
+        startAllAsync(progressOut);
+        List<CompletableFuture<Void>> futures = startupFutures.values().stream().toList();
+        if (!futures.isEmpty()) {
+            try {
+                CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+            } catch (Exception e) {
+                // 各 server 的异常已由 start() 自身处理，这里只需要等全部结束。
+            }
+        }
+    }
+
+    /**
+     * 后台异步启动所有 MCP server，不阻塞调用线程。
+     * 每台 server 就绪或失败后立即通过 {@code progressOut} 打印一行结果。
+     * 调用方可通过 {@link #awaitServer} 按需等待指定 server。
+     */
+    public void startAllAsync(PrintStream progressOut) {
         List<McpServer> targets = servers.values().stream()
                 .filter(server -> !server.config().isDisabled())
                 .toList();
         if (targets.isEmpty()) {
             return;
         }
+        startupFutures.clear();
         // 用专属 daemon executor，避免 npx/uvx 冷启动期间占满 ForkJoinPool.commonPool 影响其他并发任务。
         AtomicInteger threadId = new AtomicInteger();
         ExecutorService executor = Executors.newFixedThreadPool(
@@ -90,22 +112,76 @@ public class McpServerManager implements AutoCloseable {
                     return t;
                 });
         Thread progressPrinter = startProgressPrinter(targets, progressOut, STARTUP_PROGRESS_INTERVAL);
-        try {
-            List<CompletableFuture<Void>> futures = targets.stream()
-                    .map(server -> CompletableFuture.runAsync(() -> start(server), executor))
-                    .toList();
-            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
-        } finally {
-            if (progressPrinter != null) {
-                progressPrinter.interrupt();
-                try {
-                    progressPrinter.join(1000);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                }
-            }
-            executor.shutdown();
+        List<CompletableFuture<Void>> futures = targets.stream()
+                .map(server -> {
+                    CompletableFuture<Void> fut = CompletableFuture.runAsync(() -> start(server), executor);
+                    // 每台 server 完成后的单行结果打印
+                    fut.whenComplete((v, error) -> {
+                        if (progressOut != null) {
+                            if (server.status() == McpServerStatus.READY) {
+                                progressOut.printf("  ✓ %s 就绪（%d 个工具）%n",
+                                        server.name(), server.tools().size());
+                            } else if (server.status() == McpServerStatus.ERROR) {
+                                progressOut.printf("  ✗ %s 启动失败：%s%n",
+                                        server.name(),
+                                        server.errorMessage() != null ? server.errorMessage() : "未知错误");
+                            }
+                            progressOut.flush();
+                        }
+                    });
+                    startupFutures.put(server.name(), fut);
+                    return fut;
+                })
+                .toList();
+        // 全部完成后清理 progress printer 和 executor
+        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
+                .whenComplete((v, ex) -> {
+                    if (progressPrinter != null) {
+                        progressPrinter.interrupt();
+                        try {
+                            progressPrinter.join(1000);
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                        }
+                    }
+                    executor.shutdown();
+                });
+    }
+
+    /**
+     * 等待指定 MCP server 启动就绪，超时返回 false。
+     *
+     * @param name    server 名称
+     * @param timeout 最大等待时间
+     * @return true 如果 server 在超时内变为 READY 状态；false 表示超时或 server 不可用
+     */
+    public boolean awaitServer(String name, Duration timeout) {
+        McpServer server = servers.get(name);
+        if (server == null) {
+            return false;
         }
+        // 已就绪或已处于终态，直接返回
+        if (server.status() == McpServerStatus.READY) {
+            return true;
+        }
+        if (server.status() == McpServerStatus.ERROR || server.status() == McpServerStatus.DISABLED) {
+            return false;
+        }
+        // 仍在 STARTING，等待对应 future
+        CompletableFuture<Void> future = startupFutures.get(name);
+        if (future == null) {
+            return false;
+        }
+        try {
+            future.get(timeout.toMillis(), TimeUnit.MILLISECONDS);
+        } catch (java.util.concurrent.TimeoutException e) {
+            return false;
+        } catch (Exception e) {
+            // future 异常完成（理论上不会发生，因为 start() 内部 catch 了所有异常）
+            return false;
+        }
+        // future 完成后再次检查状态
+        return server.status() == McpServerStatus.READY;
     }
 
     private Thread startProgressPrinter(List<McpServer> targets, PrintStream out, Duration interval) {
@@ -409,10 +485,27 @@ public class McpServerManager implements AutoCloseable {
     }
 
     private Function<String, ToolOutput> wrapInvoker(McpServer server, McpClient client, McpToolDescriptor descriptor) {
+        // 检查 server 状态——STARTING 时等最多 5s，ERROR/DISABLED 直接返回不可用。
+        // 工具注册时 server 可能仍是 STARTING（replaceTools 在 status=READY 前调用），
+        // 但在工具实际被 LLM 调用时 server 几乎肯定已就绪；此处作为兜底保险。
+        Function<String, ToolOutput> statusGuard = args -> {
+            if (server.status() == McpServerStatus.STARTING) {
+                boolean ready = awaitServer(server.name(), Duration.ofSeconds(5));
+                if (!ready) {
+                    return ToolOutput.text("⌛ MCP server " + server.name() + " 仍在启动中，请稍后重试");
+                }
+            } else if (server.status() == McpServerStatus.ERROR || server.status() == McpServerStatus.DISABLED) {
+                String errorMsg = server.errorMessage() != null ? server.errorMessage() : "server not available";
+                return ToolOutput.text("MCP server " + server.name() + " 不可用: " + errorMsg);
+            }
+            return null; // 继续正常调用
+        };
         if (browserTabManager != null
                 && "chrome-devtools".equals(server.name())
                 && "navigate_page".equals(descriptor.name())) {
             return args -> {
+                ToolOutput guarded = statusGuard.apply(args);
+                if (guarded != null) return guarded;
                 String normalizedArgs = normalizeNavigateUrl(args);
                 String targetUrl = extractUrlFromArgs(normalizedArgs);
                 if (targetUrl != null) {
@@ -422,9 +515,17 @@ public class McpServerManager implements AutoCloseable {
             };
         }
         if (isResourceVirtualTool(descriptor)) {
-            return args -> ToolOutput.text(McpResourceTool.invoker(client, descriptor).apply(args));
+            return args -> {
+                ToolOutput guarded = statusGuard.apply(args);
+                if (guarded != null) return guarded;
+                return ToolOutput.text(McpResourceTool.invoker(client, descriptor).apply(args));
+            };
         }
-        return args -> invokeMcpToolOutput(client, descriptor, args);
+        return args -> {
+            ToolOutput guarded = statusGuard.apply(args);
+            if (guarded != null) return guarded;
+            return invokeMcpToolOutput(client, descriptor, args);
+        };
     }
 
     /**
@@ -579,6 +680,7 @@ public class McpServerManager implements AutoCloseable {
 
     @Override
     public void close() {
+        startupFutures.clear();
         for (McpServer server : servers.values()) {
             unregisterTools(server);
             server.close();

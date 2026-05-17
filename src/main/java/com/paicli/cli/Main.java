@@ -64,6 +64,7 @@ import java.io.FileReader;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -244,14 +245,14 @@ public class Main {
                     System.out.println(bootstrapResult.message());
                 }
                 mcpServerManager.loadConfiguredServers();
-                mcpServerManager.startAll(System.out);
-                Runtime.getRuntime().addShutdownHook(new Thread(mcpServerManager::close, "paicli-mcp-shutdown"));
-                System.out.println(mcpServerManager.startupSummary());
-                System.out.println();
             } catch (Exception e) {
-                System.out.println("⚠️ MCP 初始化失败: " + e.getMessage());
+                System.out.println("⚠️ MCP 配置加载失败: " + e.getMessage());
                 System.out.println("   可检查 ~/.paicli/mcp.json 或 .paicli/mcp.json\n");
             }
+            mcpServerManager.startAllAsync(System.out);
+            System.out.println("🔌 MCP server 后台启动中...");
+            System.out.println();
+            Runtime.getRuntime().addShutdownHook(new Thread(mcpServerManager::close, "paicli-mcp-shutdown"));
             LineReader lineReader = LineReaderBuilder.builder()
                     .terminal(terminal)
                     .completer(new PaiCliCompleter(mcpServerManager::resourceCandidates))
@@ -1410,7 +1411,7 @@ public class Main {
                 yield browserAutoConnect(browserSession, mcpServerManager, hitlHandler);
             }
             case "disconnect" -> browserDisconnect(browserSession, mcpServerManager, hitlHandler);
-            case "tabs" -> browserTabs(browserSession, registry);
+            case "tabs" -> browserTabs(browserSession, mcpServerManager, registry);
             default -> """
                     ❌ 未知 /browser 子命令: %s
                     可用命令：
@@ -1516,9 +1517,18 @@ public class Main {
         return "🔄 已切回 isolated 浏览器模式\n" + result;
     }
 
-    private static String browserTabs(BrowserSession browserSession, HitlToolRegistry registry) {
+    private static String browserTabs(BrowserSession browserSession, McpServerManager mcpServerManager, HitlToolRegistry registry) {
         if (browserSession.mode() != BrowserMode.SHARED) {
             return "当前为 isolated 模式，没有真实 Chrome tab 可复用。可用 /browser connect 切到 shared 模式。";
+        }
+        // 等待 chrome-devtools server 就绪（最多 5s），未就绪时给出友好提示
+        boolean ready = mcpServerManager.awaitServer("chrome-devtools", Duration.ofSeconds(5));
+        if (!ready) {
+            McpServer server = mcpServerManager.server("chrome-devtools");
+            String msg = server != null && server.errorMessage() != null
+                    ? server.errorMessage()
+                    : "仍在启动中，请稍后重试";
+            return "❌ chrome-devtools 未就绪: " + msg;
         }
         String result = registry.executeTool("mcp__chrome-devtools__list_pages", "{}");
         if (result.contains("TimeoutException") || result.contains("JSON-RPC request timed out: tools/call")) {

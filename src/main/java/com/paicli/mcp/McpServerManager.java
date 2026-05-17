@@ -22,7 +22,6 @@ import java.io.IOException;
 import java.io.PrintStream;
 import java.nio.file.Path;
 import java.time.Duration;
-import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Comparator;
@@ -38,8 +37,6 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Function;
 
 public class McpServerManager implements AutoCloseable {
-    private static final Duration STARTUP_PROGRESS_INTERVAL = Duration.ofSeconds(5);
-
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
     private final ToolRegistry toolRegistry;
@@ -103,6 +100,7 @@ public class McpServerManager implements AutoCloseable {
         }
         startupFutures.clear();
         // 用专属 daemon executor，避免 npx/uvx 冷启动期间占满 ForkJoinPool.commonPool 影响其他并发任务。
+        // 异步模式下不启动进度轮询——server 就绪/失败由 whenComplete 单行打印，避免与输入区交错。
         AtomicInteger threadId = new AtomicInteger();
         ExecutorService executor = Executors.newFixedThreadPool(
                 Math.min(targets.size(), 8),
@@ -111,11 +109,9 @@ public class McpServerManager implements AutoCloseable {
                     t.setDaemon(true);
                     return t;
                 });
-        Thread progressPrinter = startProgressPrinter(targets, progressOut, STARTUP_PROGRESS_INTERVAL);
         List<CompletableFuture<Void>> futures = targets.stream()
                 .map(server -> {
                     CompletableFuture<Void> fut = CompletableFuture.runAsync(() -> start(server), executor);
-                    // 每台 server 完成后的单行结果打印
                     fut.whenComplete((v, error) -> {
                         if (progressOut != null) {
                             if (server.status() == McpServerStatus.READY) {
@@ -133,19 +129,9 @@ public class McpServerManager implements AutoCloseable {
                     return fut;
                 })
                 .toList();
-        // 全部完成后清理 progress printer 和 executor
+        // 全部完成后清理 executor
         CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
-                .whenComplete((v, ex) -> {
-                    if (progressPrinter != null) {
-                        progressPrinter.interrupt();
-                        try {
-                            progressPrinter.join(1000);
-                        } catch (InterruptedException e) {
-                            Thread.currentThread().interrupt();
-                        }
-                    }
-                    executor.shutdown();
-                });
+                .whenComplete((v, ex) -> executor.shutdown());
     }
 
     /**
@@ -182,39 +168,6 @@ public class McpServerManager implements AutoCloseable {
         }
         // future 完成后再次检查状态
         return server.status() == McpServerStatus.READY;
-    }
-
-    private Thread startProgressPrinter(List<McpServer> targets, PrintStream out, Duration interval) {
-        if (out == null || targets.isEmpty()) {
-            return null;
-        }
-        Map<String, Instant> startedAt = new ConcurrentHashMap<>();
-        targets.forEach(server -> startedAt.put(server.name(), Instant.now()));
-        Thread thread = new Thread(() -> {
-            try {
-                while (!Thread.currentThread().isInterrupted()) {
-                    TimeUnit.MILLISECONDS.sleep(interval.toMillis());
-                    List<McpServer> starting = targets.stream()
-                            .filter(server -> server.status() == McpServerStatus.STARTING)
-                            .sorted(Comparator.comparing(McpServer::name))
-                            .toList();
-                    if (starting.isEmpty()) {
-                        continue;
-                    }
-                    for (McpServer server : starting) {
-                        long waited = Duration.between(startedAt.get(server.name()), Instant.now()).toSeconds();
-                        out.printf("   ⏳ %-16s %-6s 启动中...（已等待 %ds）%n",
-                                server.name(), server.transportName(), waited);
-                    }
-                    out.flush();
-                }
-            } catch (InterruptedException ignored) {
-                Thread.currentThread().interrupt();
-            }
-        }, "paicli-mcp-startup-progress");
-        thread.setDaemon(true);
-        thread.start();
-        return thread;
     }
 
     public synchronized String restart(String name) {

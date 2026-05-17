@@ -73,9 +73,12 @@ public class McpServerManager implements AutoCloseable {
 
     /**
      * 同步启动所有 MCP server，内部复用 {@link #startAllAsync} 的 future 并等待完成。
+     *
+     * @param progressOut 可选输出流；不为 null 时在全部启动后输出一条合并摘要
      */
     public void startAll(PrintStream progressOut) {
-        startAllAsync(progressOut);
+        MergedMcpStartupNotifier notifier = new MergedMcpStartupNotifier(true);
+        startAllAsync(notifier);
         List<CompletableFuture<Void>> futures = startupFutures.values().stream().toList();
         if (!futures.isEmpty()) {
             try {
@@ -84,14 +87,26 @@ public class McpServerManager implements AutoCloseable {
                 // 各 server 的异常已由 start() 自身处理，这里只需要等全部结束。
             }
         }
+        if (progressOut != null) {
+            String summary = notifier.drain();
+            if (!summary.isEmpty()) {
+                progressOut.println(summary);
+            }
+        }
     }
 
     /**
      * 后台异步启动所有 MCP server，不阻塞调用线程。
-     * 每台 server 就绪或失败后立即通过 {@code progressOut} 打印一行结果。
+     * <p>
+     * {@link McpStartupNotifier} 接收每个 server 的状态事件并缓冲；
+     * 调用方在安全输出窗口（如进入用户输入循环前）调 {@link MergedMcpStartupNotifier#drain()}
+     * 获取合并摘要。启动期间不主动写终端，避免与 LineReader 输入区交错。
+     * <p>
      * 调用方可通过 {@link #awaitServer} 按需等待指定 server。
+     *
+     * @param notifier 启动状态通知器（传 {@link McpStartupNotifier#noop()} 可完全静默）
      */
-    public void startAllAsync(PrintStream progressOut) {
+    public void startAllAsync(McpStartupNotifier notifier) {
         List<McpServer> targets = servers.values().stream()
                 .filter(server -> !server.config().isDisabled())
                 .toList();
@@ -100,7 +115,7 @@ public class McpServerManager implements AutoCloseable {
         }
         startupFutures.clear();
         // 用专属 daemon executor，避免 npx/uvx 冷启动期间占满 ForkJoinPool.commonPool 影响其他并发任务。
-        // 异步模式下不启动进度轮询——server 就绪/失败由 whenComplete 单行打印，避免与输入区交错。
+        // 异步模式下不写终端——事件交由 notifier 缓冲，安全时刻由调用方提取。
         AtomicInteger threadId = new AtomicInteger();
         ExecutorService executor = Executors.newFixedThreadPool(
                 Math.min(targets.size(), 8),
@@ -113,25 +128,23 @@ public class McpServerManager implements AutoCloseable {
                 .map(server -> {
                     CompletableFuture<Void> fut = CompletableFuture.runAsync(() -> start(server), executor);
                     fut.whenComplete((v, error) -> {
-                        if (progressOut != null) {
-                            if (server.status() == McpServerStatus.READY) {
-                                progressOut.printf("  ✓ %s 就绪（%d 个工具）%n",
-                                        server.name(), server.tools().size());
-                            } else if (server.status() == McpServerStatus.ERROR) {
-                                progressOut.printf("  ✗ %s 启动失败：%s%n",
-                                        server.name(),
-                                        server.errorMessage() != null ? server.errorMessage() : "未知错误");
-                            }
-                            progressOut.flush();
+                        if (server.status() == McpServerStatus.READY) {
+                            notifier.onServerReady(server.name(), server.tools().size());
+                        } else if (server.status() == McpServerStatus.ERROR) {
+                            notifier.onServerFailed(server.name(),
+                                    server.errorMessage() != null ? server.errorMessage() : "未知错误");
                         }
                     });
                     startupFutures.put(server.name(), fut);
                     return fut;
                 })
                 .toList();
-        // 全部完成后清理 executor
+        // 全部完成后通知 notifier 并清理 executor
         CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
-                .whenComplete((v, ex) -> executor.shutdown());
+                .whenComplete((v, ex) -> {
+                    notifier.onStartupComplete();
+                    executor.shutdown();
+                });
     }
 
     /**

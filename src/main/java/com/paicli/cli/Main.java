@@ -27,6 +27,7 @@ import com.paicli.image.ClipboardImage;
 import com.paicli.mcp.McpServer;
 import com.paicli.mcp.McpServerManager;
 import com.paicli.mcp.McpServerStatus;
+import com.paicli.mcp.MergedMcpStartupNotifier;
 import com.paicli.mcp.mention.AtMentionExpander;
 import com.paicli.plan.ExecutionPlan;
 import com.paicli.rag.CodeIndex;
@@ -249,8 +250,9 @@ public class Main {
                 System.out.println("⚠️ MCP 配置加载失败: " + e.getMessage());
                 System.out.println("   可检查 ~/.paicli/mcp.json 或 .paicli/mcp.json\n");
             }
-            mcpServerManager.startAllAsync(System.out);
-            System.out.println("🔌 MCP server 后台启动中...");
+            MergedMcpStartupNotifier mcpStartupNotifier = new MergedMcpStartupNotifier(true);
+            mcpServerManager.startAllAsync(mcpStartupNotifier);
+            System.out.println("🔌 MCP server 后台启动中，可用 /mcp 查看状态");
             System.out.println();
             Runtime.getRuntime().addShutdownHook(new Thread(mcpServerManager::close, "paicli-mcp-shutdown"));
             LineReader lineReader = LineReaderBuilder.builder()
@@ -334,7 +336,18 @@ public class Main {
             bindCtrlVToClipboardImage(lineReader);
             bindEscToClearInput(lineReader);
 
+            // 安全窗口：MCP 可能已完成，打印一次合并摘要
+            String mcpSummary = mcpStartupNotifier.drain();
+            if (!mcpSummary.isEmpty()) {
+                System.out.println(mcpSummary);
+            }
+
             while (true) {
+                // 每次用户输入前检查 MCP 启动摘要（如果刚完成）
+                String s = mcpStartupNotifier.drain();
+                if (!s.isEmpty()) {
+                    System.out.println(s);
+                }
                 PromptInput promptInput;
                 try {
                     promptInput = readPromptInput(terminal, lineReader,
@@ -892,6 +905,10 @@ public class Main {
                                                boolean allowEscCancel,
                                                boolean spaciousPrompt)
             throws UserInterruptException, EndOfFileException {
+        // 确保 prompt 绘制前清除当前行残留文本。System.out（MCP 摘要等）和
+        // JLine terminal.writer() 可能不同步，导致行尾残留启动文案。
+        terminal.writer().print("\u001B[2K\r");
+        terminal.writer().flush();
         if (spaciousPrompt) {
             System.out.println();
         }
